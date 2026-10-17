@@ -11,8 +11,11 @@ text, so a changed banner can never break the parse. The same module decides
 which frames are worth rasterizing at all: `detect_scenes` scores hard cuts,
 `sample_candidates` merges them with interval ticks and collapses near
 duplicates by perceptual hash, and `rank_candidates` spends the caller's
-frame budget with a complete reason accounting. The frame half then
-rasterizes what was chosen: `resolve_crop` turns an explicit box, `"auto"`,
+frame budget with a complete reason accounting. `detect_audio_events` reads
+the audio timeline itself — silence segments from ffmpeg's `silencedetect`
+and loudness peaks from its `astats` per-frame report — so the ranker and the
+manifest consume measured events instead of invented ones. The frame half
+then rasterizes what was chosen: `resolve_crop` turns an explicit box, `"auto"`,
 or nothing into crop geometry, `extract_frame` pulls one still through
 `crop` and the bounded scale, `render_sheet` and `render_filmstrip`
 composite labelled tiles into one PNG, and `resolve_font` finds a font
@@ -36,6 +39,7 @@ import math
 import os
 import re
 import signal
+import statistics
 import struct
 import subprocess
 import tempfile
@@ -45,6 +49,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import BinaryIO, Generic, TypeVar
+
+from media.artifacts import format_timestamp
 
 _PayloadT_co = TypeVar("_PayloadT_co", covariant=True)
 
@@ -97,6 +103,45 @@ _SCD_LINE = re.compile(
     r"lavfi\.scd\.score:\s*(?P<score>[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"
     r"\s*,\s*lavfi\.scd\.time:\s*(?P<time>[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"
 )
+
+# ffmpeg's silencedetect report shape on stderr: a start line and, once the
+# segment closes, an end line that repeats the boundary and carries the
+# measured duration. Matched as tolerantly as the scdet lines, so a changed
+# banner prefix never matters.
+_SILENCE_START = re.compile(r"silence_start:\s*(?P<time>-?[0-9]+(?:\.[0-9]+)?)")
+_SILENCE_END = re.compile(
+    r"silence_end:\s*(?P<time>-?[0-9]+(?:\.[0-9]+)?)"
+    r"(?:\s*\|\s*silence_duration:\s*(?P<duration>-?[0-9]+(?:\.[0-9]+)?))?"
+)
+
+# astats' per-frame report once `ametadata=mode=print:key=...` narrows it to
+# one line per frame: the frame header carries the media timestamp and the
+# kept line carries the level. `-inf` is what digital silence measures.
+_ASTATS_FRAME = re.compile(
+    r"^frame:\d+\s+pts:\S+\s+pts_time:(?P<time>-?[0-9]+(?:\.[0-9]+)?)\s*$"
+)
+_ASTATS_PEAK = re.compile(
+    r"^lavfi\.astats\.Overall\.Peak_level="
+    r"(?P<level>-?[0-9]+(?:\.[0-9]+)?|-inf|nan)\s*$"
+)
+_LEVEL_NOT_A_NUMBER = frozenset({"-inf", "inf", "nan"})
+
+# The loud-peak rule: a peak must clear the file's own median frame level by
+# this margin. Measured on this host with the spike fixture: the base tone's
+# per-frame sample peaks sit at -38.01..-37.32 dB (a 0.69 dB band) while the
+# deliberate one-second spike peaks at -4.06 dB, 33.9 dB above the -37.99 dB
+# median. Ten decibels clears the measured jitter by more than 9 dB and stays
+# well below the spike, so ordinary level drift cannot invent a peak.
+_LOUD_MARGIN_DB = 10.0
+
+# astats' frame size for the loudness pass: `aresample` normalizes every
+# source to 48 kHz first, so 9600 samples are 0.2 seconds at any input rate.
+# Left at the incoming 1024-sample frames, astats prints about 47 frames per
+# media second, which fills run_child's 8 MiB capture cap after roughly half
+# an hour; 0.2-second frames keep a two-hour source near 3 MB while still
+# resolving the design's one-second-scale peaks.
+_ASTATS_SAMPLE_RATE = 48000
+_ASTATS_FRAME_SAMPLES = 9600
 
 # Candidate reasons in ranking-priority order: the tuple index is the sort
 # weight, so `scene` beats `audio` beats `interval` beats `fill`.
@@ -179,6 +224,24 @@ class SceneScore:
 
     timestamp: float
     score: float
+
+
+@dataclass(frozen=True)
+class AudioEvent:
+    """One moment of the audio timeline: a silence boundary or a loud peak.
+
+    `timestamp` is the media-time second the event marks, `kind` is one of
+    `"silence_start"`, `"silence_end"`, or `"loud"`, and `detail` carries the
+    measured evidence in readable form: silencedetect's own reported start
+    seconds, the measured silence duration as `HH:MM:SS.mmm`, or a peak's
+    level against the file's own baseline. The objects satisfy the shape
+    `rank_candidates` accepts, because `_audio_event_timestamp` reads the
+    `timestamp` attribute directly.
+    """
+
+    timestamp: float
+    kind: str
+    detail: str
 
 
 @dataclass(frozen=True)
@@ -367,6 +430,203 @@ def detect_scenes(path: Path, threshold: float = 10.0) -> list[SceneScore]:
         )
         for match in _SCD_LINE.finditer(done.stderr)
     ]
+
+
+def detect_audio_events(
+    path: Path, *, noise_db: float = -30.0, min_silence: float = 0.5
+) -> list[AudioEvent]:
+    """Report the silence segments and loudness peaks of `path`'s audio.
+
+    One ffmpeg pass runs both filters over the same decode:
+    `silencedetect=noise=<noise_db>dB:d=<min_silence>` writes its boundaries
+    to stderr, and `aresample=48000,asetnsamples=9600:p=1` (a fixed
+    0.2-second analysis frame, see `_ASTATS_FRAME_SAMPLES`) feeds
+    `astats=metadata=1:reset=1`, whose per-frame peak levels
+    `ametadata=mode=print:key=...` writes to stdout. Both thresholds are
+    passed into silencedetect's own arguments, so a `noise_db` above the
+    file's every level really removes the audio from the result instead of
+    being checked cosmetically afterwards.
+
+    Each silence segment yields a `silence_start` at its beginning and a
+    `silence_end` at its end; a segment still open at end of stream closes
+    at the probed duration, and an end line without a start is skipped
+    because it cannot be placed. Loudness yields one `loud` event per run
+    of consecutive analysis frames whose peak clears the file's own median
+    frame level by `_LOUD_MARGIN_DB` and the caller's noise gate. Events
+    are ordered by timestamp, and timestamps are non-negative and never
+    beyond the probed duration.
+
+    A source with no audio stream returns `[]` before any filter runs, and
+    a source with nothing to report also returns `[]` rather than raising.
+    A non-zero ffmpeg exit raises `MediaError` naming the path, the exit
+    code, and the captured stderr.
+    """
+    path = Path(path)
+    result = probe(path)
+    if not result.has_audio:
+        return []
+    filter_graph = (
+        f"silencedetect=noise={_plain_decimal(noise_db)}"
+        f"dB:d={_plain_decimal(min_silence)},"
+        f"aresample={_ASTATS_SAMPLE_RATE},"
+        f"asetnsamples=n={_ASTATS_FRAME_SAMPLES}:p=1,"
+        "astats=metadata=1:reset=1,"
+        "ametadata=mode=print:key=lavfi.astats.Overall.Peak_level:file=-"
+    )
+    argv = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-i",
+        str(path),
+        "-af",
+        filter_graph,
+        "-vn",
+        "-f",
+        "null",
+        "-",
+    ]
+    done = run_child(argv)
+    if done.returncode != 0:
+        raise MediaError(
+            f"audio event detection failed for {path}: ffmpeg exited "
+            f"{done.returncode}; captured stderr: {done.stderr.strip() or '(none)'}"
+        )
+    events = _silence_events(done.stderr, result.duration)
+    events += _loud_events(_astats_frames(done.stdout), noise_db)
+    bounded = [event for event in events if 0.0 <= event.timestamp <= result.duration]
+    bounded.sort(key=lambda event: event.timestamp)
+    return bounded
+
+
+def _silence_events(stderr: str, duration: float) -> list[AudioEvent]:
+    """Pair silencedetect's start and end lines into two events per segment.
+
+    A start line is held until its matching end line arrives; the start
+    event carries the filter's own reported seconds in `detail` and the end
+    event the measured duration as `HH:MM:SS.mmm`. When the end line omits
+    a duration, the boundary difference is used instead. A start still open
+    at end of stream is closed at the probed `duration`, which is how a
+    source that ends while silent still reports its trailing segment; an
+    end without a start has no beginning to report and is skipped. Lines of
+    any other shape (banners, progress, astats noise) are ignored.
+    """
+    events: list[AudioEvent] = []
+    open_start: float | None = None
+    open_reported = ""
+    for line in stderr.splitlines():
+        started = _SILENCE_START.search(line)
+        if started is not None:
+            open_start = float(started.group("time"))
+            open_reported = started.group("time")
+            continue
+        ended = _SILENCE_END.search(line)
+        if ended is None or open_start is None:
+            continue
+        stop = float(ended.group("time"))
+        measured = ended.group("duration")
+        span = float(measured) if measured is not None else stop - open_start
+        events.append(
+            AudioEvent(
+                timestamp=open_start,
+                kind="silence_start",
+                detail=f"silence_start {open_reported}s",
+            )
+        )
+        events.append(
+            AudioEvent(
+                timestamp=stop,
+                kind="silence_end",
+                detail=f"silence duration {format_timestamp(span)}",
+            )
+        )
+        open_start = None
+        open_reported = ""
+    if open_start is not None and duration > open_start:
+        events.append(
+            AudioEvent(
+                timestamp=open_start,
+                kind="silence_start",
+                detail=f"silence_start {open_reported}s",
+            )
+        )
+        events.append(
+            AudioEvent(
+                timestamp=duration,
+                kind="silence_end",
+                detail=(f"silence duration {format_timestamp(duration - open_start)}"),
+            )
+        )
+    return events
+
+
+def _astats_frames(stdout: str) -> list[tuple[float, float]]:
+    """Pair astats' frame timestamps with their Overall peak levels.
+
+    `ametadata=mode=print` writes a `frame:... pts_time:<seconds>` header
+    followed by the selected metadata line; parsing walks the lines in order
+    and pairs each header with the first `lavfi.astats.Overall.Peak_level`
+    after it. `-inf` and `nan` (digital silence, an empty frame) are dropped
+    so they can neither drag the median down nor fake a peak. Any other line
+    is ignored, so a banner or a stray statistic never breaks the parse.
+    """
+    frames: list[tuple[float, float]] = []
+    current: float | None = None
+    for line in stdout.splitlines():
+        header = _ASTATS_FRAME.match(line)
+        if header is not None:
+            current = float(header.group("time"))
+            continue
+        level = _ASTATS_PEAK.match(line)
+        if level is None or current is None:
+            continue
+        value = level.group("level")
+        if value not in _LEVEL_NOT_A_NUMBER:
+            frames.append((current, float(value)))
+        current = None
+    return frames
+
+
+def _loud_events(
+    frames: list[tuple[float, float]], noise_db: float
+) -> list[AudioEvent]:
+    """Promote runs of analysis frames that stand out from the baseline.
+
+    The baseline is the median of the finite frame levels: a minority of
+    loud frames cannot drag a median up the way a mean could, so the rule
+    compares against the file's own quiet level. A frame qualifies only when
+    its peak clears `baseline + _LOUD_MARGIN_DB` and sits above the caller's
+    `noise_db` gate, so raising the gate above a source's every level leaves
+    no peak to report. Consecutive qualifying frames are one peak, reported
+    at the first frame's timestamp with the run's highest level and its
+    margin over the baseline in `detail`.
+    """
+    if not frames:
+        return []
+    baseline = statistics.median(level for _, level in frames)
+    threshold = baseline + _LOUD_MARGIN_DB
+    runs: list[list[int]] = []
+    for index, (_, level) in enumerate(frames):
+        if level < threshold or level <= noise_db:
+            continue
+        if runs and index == runs[-1][-1] + 1:
+            runs[-1].append(index)
+        else:
+            runs.append([index])
+    events: list[AudioEvent] = []
+    for run in runs:
+        peak = max(frames[index][1] for index in run)
+        events.append(
+            AudioEvent(
+                timestamp=frames[run[0]][0],
+                kind="loud",
+                detail=(
+                    f"peak {peak:.1f} dB, {peak - baseline:+.1f} dB over the "
+                    f"{baseline:.1f} dB baseline"
+                ),
+            )
+        )
+    return events
 
 
 def diff_hash_of(raw: bytes) -> int:

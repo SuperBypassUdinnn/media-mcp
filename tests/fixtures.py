@@ -27,6 +27,9 @@ AUDIO_RATE = 48000
 BASE_VOLUME = 0.1
 SPIKE_VOLUME = 5.0
 SPIKE_SECONDS = 1.0
+# The audible-tone-with-a-gap clip: a sine gain that measures about -15 dB RMS
+# on this host, comfortably above the default -30 dB silence gate.
+GAP_TONE_VOLUME = 2.0
 # The motion-patch clip: a static dark background with one opaque light patch
 # whose exact on-screen rectangle and switch-on time the tests assert against.
 MOTION_PATCH = (700, 420, 300, 180)
@@ -133,6 +136,54 @@ def make_audio_only(path: Path) -> Path:
             "lavfi",
             "-i",
             f"sine=frequency=440:sample_rate={AUDIO_RATE}:duration={AUDIO_SECONDS}",
+            "-vn",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            str(path),
+        ]
+    )
+    return path
+
+
+def make_audio_gap(
+    path: Path,
+    *,
+    duration: int = 6,
+    gap_at: float = 2.0,
+    gap_seconds: float = 1.0,
+) -> Path:
+    """Write an audio-only tone that goes digitally silent for one bounded stretch.
+
+    `make_audio_only` carries a steady tone for its whole length and
+    `make_silent_video` is silent for its whole length, so neither can express
+    the "audible, then silent, then audible again" shape silence detection has
+    to bracket. A sine at `GAP_TONE_VOLUME` stays well above the default -30 dB
+    silence gate while the `[gap_at, gap_at + gap_seconds)` window multiplies it
+    by zero, and no video stream is written, so this builder also exercises the
+    audio-only path.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stop = min(gap_at + gap_seconds, float(duration))
+    _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=440:sample_rate={AUDIO_RATE}:duration={duration}",
+            "-af",
+            (
+                f"volume=volume='if(between(t,{gap_at},{stop}),0,{GAP_TONE_VOLUME})'"
+                ":eval=frame"
+            ),
             "-vn",
             "-c:a",
             "aac",
