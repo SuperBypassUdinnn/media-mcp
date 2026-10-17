@@ -911,21 +911,26 @@ git add -A && git commit -m "feat(contracts): delegated transcription contract"
   - `parse_timestamp(value: str | float) -> float` and the shared validators
     rejecting `window` with a list, out-of-range `count`, `fps`, `k`, and
     `crop`, and ambiguous combinations.
-  - `main() -> None` running `FastMCP("media").run()` over stdio.
+  - `main() -> None` running an `mcp.server.MCPServer("media")` over stdio
+    (`run(transport="stdio")` or `run_stdio_async()`); the seven tools are
+    registered with its `tool(...)` decorator. The installed SDK is `mcp` 2.x,
+    where `FastMCP` was renamed `MCPServer` and `mcp.server.fastmcp` no longer
+    exists.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
 def test_every_tool_is_advertised_with_a_schema(server_session):
-    names = {t.name for t in server_session.list_tools().tools}
+    tools = server_session.list_tools().tools
+    names = {t.name for t in tools}
     assert names == {"media_probe", "media_manifest", "media_frames", "media_ocr",
                      "media_transcript", "media_search", "media_cache"}
-    assert all(t.inputSchema for t in server_session.list_tools().tools)
+    assert all(t.input_schema for t in tools)
 
 
 def test_malformed_parameter_returns_an_error_not_a_crash(server_session):
     result = server_session.call("media_frames", {"source": "x.mp4", "at": [1, 2], "window": 5})
-    assert result.isError and "window" in result.text.lower()
+    assert result.is_error and "window" in result.text.lower()
 
 
 def test_cancelled_request_terminates_cleanly(server_session):
@@ -953,11 +958,19 @@ Expected: FAIL, `ModuleNotFoundError: No module named 'media.server'`.
 - [ ] **Step 3: Implement `server.py` and the stdio test fixtures**
 
 The contract fixture launches `media/.venv/bin/python media/server.py` as a
-subprocess and speaks MCP over stdio with `mcp.client.stdio`, which is what
-proves the server works as a client sees it. `media_manifest` assembles its
-Markdown digest from cached artifacts, running only the stages the profile
-declares. `media_cache` reports entry tables, `total_bytes` against the cap,
-dependency status from `contracts.self_check()`, and eviction results.
+subprocess and speaks MCP over stdio with `mcp.client.stdio.stdio_client` plus
+`mcp.client.session.ClientSession`, which is what proves the server works as a
+client sees it; `mcp.client.Client(server)` offers an in-memory alternative but
+would not exercise the transport the two clients actually use. In this SDK
+version the wire fields are snake_case (`Tool.input_schema`,
+`CallToolResult.is_error`, `ImageContent.mime_type`), so the fixture exposes the
+spellings the SDK returns. Because a gracefully-exited server's children are
+deliberately left alive on POSIX, the server terminates its own ffmpeg children
+when stdin reaches EOF, and the fixture asserts that no child survives the
+session. `media_manifest` assembles its Markdown digest from cached artifacts,
+running only the stages the profile declares. `media_cache` reports entry
+tables, `total_bytes` against the cap, dependency status from
+`contracts.self_check()`, and eviction results.
 
 - [ ] **Step 4: Run the tests again**
 
