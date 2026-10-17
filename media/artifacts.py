@@ -356,18 +356,12 @@ TIMELINE_LAYERS = frozenset({"scene", "audio", "speech", "ocr", "ocr-change"})
 # `search` returns at most this many hits regardless of the requested `k`.
 _SEARCH_K_CAP = 20
 
-# Which timeline layers each search scope looks at. The timeline carries the
-# projection, never the source file names, so "transcript" means the speech
-# lines and "ocr" means both OCR layers.
-_SCOPE_LAYERS = {
-    "all": TIMELINE_LAYERS,
-    "transcript": frozenset({"speech"}),
-    "ocr": frozenset({"ocr", "ocr-change"}),
-}
+# The scopes `search` accepts, mapped to the artifacts each one reads.
+_SEARCH_SCOPES = frozenset({"all", "transcript", "ocr"})
 
-# The line format `write_timeline` emits and `search` parses. Everything about
-# it is fixed-width by design, which is what makes malformed lines detectable
-# instead of silently accepted.
+# The line format `write_timeline` emits, and the stamped form accepted as a
+# record timestamp. Both are fixed-width by design, which is what makes
+# malformed content detectable instead of silently accepted.
 _TIMELINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{3})\] (\S+) \| (.*)$")
 
 # A token for scoring: a run of word characters, compared lowercased.
@@ -451,20 +445,28 @@ class Hit:
 
 
 def search(entry: Path, query: str, k: int = 8, scope: str = "all") -> list[Hit]:
-    """Rank the entry's timeline lines by case-insensitive token overlap.
+    """Rank transcript segments and OCR records by case-insensitive token overlap.
 
-    The timeline carries the projection of the transcript segments and the
-    per-frame OCR results, so one line-by-line scan covers both sources: a
-    `scope` of `"transcript"` looks at the speech layer, `"ocr"` at both OCR
-    layers, `"all"` at everything. At most `k` hits return, hard-capped at
-    20. Ordering is score descending, then earlier timestamp first, then line
-    number; because lines are already chronological, the stable sort makes
-    repeated runs produce identical output. A missing timeline, a `k` of
-    zero, or a query without tokens simply returns no hits; a malformed line
-    is skipped with its line number kept so it can never perturb the ranking.
+    The search source is the brief's surface: `<entry>/transcript.json`
+    segments (its `{"meta", "segments"}` shape) and every
+    `<entry>/ocr/*.json` record, one candidate per record and one per
+    segment. A transcript hit carries the segment's `start` as its
+    timestamp, the `speech` layer, and the segment text prefixed with the
+    speaker when present; an OCR hit carries the record's timestamp, the
+    `ocr` layer, and the recorded text. `scope="transcript"` reads only the
+    transcript, `"ocr"` only the OCR records, `"all"` (default) unions both
+    and ranks them together. At most `k` hits return, hard-capped at 20;
+    ordering is score descending, then earlier timestamp first, with the
+    deterministic collection order (transcript segments, then OCR files in
+    name order) so repeated runs are byte-identical.
+
+    A missing artifact, malformed JSON, or a record without a usable
+    timestamp is skipped and counted, never fatal, so one bad artifact can
+    never suppress hits another artifact still offers. A query without
+    tokens simply returns no hits.
     """
-    if scope not in _SCOPE_LAYERS:
-        allowed = ", ".join(sorted(_SCOPE_LAYERS))
+    if scope not in _SEARCH_SCOPES:
+        allowed = ", ".join(sorted(_SEARCH_SCOPES))
         raise ValueError(f"unknown search scope {scope!r} (expected one of: {allowed})")
     limit = min(k, _SEARCH_K_CAP)
     if limit <= 0:
@@ -472,29 +474,129 @@ def search(entry: Path, query: str, k: int = 8, scope: str = "all") -> list[Hit]
     query_tokens = _token_set(query)
     if not query_tokens:
         return []
-    path = Path(entry) / "timeline.md"
+    entry = Path(entry)
+    # `skipped` records every artifact or record dropped as unreadable, so a
+    # caller-visible status could always name them; the count never changes
+    # the ranking of the hits that survive.
+    skipped = [0]
+    hits: list[Hit] = []
+    if scope in ("all", "transcript"):
+        hits += _transcript_hits(entry, query_tokens, skipped)
+    if scope in ("all", "ocr"):
+        hits += _ocr_hits(entry, query_tokens, skipped)
+    hits.sort(key=lambda hit: (-hit.score, hit.timestamp))
+    return hits[:limit]
+
+
+def _transcript_hits(
+    entry: Path, query_tokens: frozenset[str], skipped: list[int]
+) -> list[Hit]:
+    """Return `speech` hits from `<entry>/transcript.json`, or none of it.
+
+    One candidate per segment, timestamped at the segment `start`. A missing
+    file, unreadable JSON, a `segments` field of the wrong type, a
+    non-dictionary segment, or a segment without a usable `start` counts as
+    one skip. A segment whose text shares no query token simply produces no
+    hit; that is a miss, not a skip.
+    """
+    path = entry / "transcript.json"
     if not path.is_file():
         return []
-    wanted = _SCOPE_LAYERS[scope]
+    try:
+        data: Any = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        skipped[0] += 1
+        return []
+    segments = data.get("segments") if isinstance(data, dict) else None
+    if not isinstance(segments, list):
+        skipped[0] += 1
+        return []
     hits: list[Hit] = []
-    with path.open(encoding="utf-8") as stream:
-        # Line-by-line: the file is scanned in streaming order and never held
-        # in memory; insertion order below is line order, which is what the
-        # sort's stability turns into the "then line number" tie-break.
-        for raw in stream:
-            parsed = _split_timeline_line(raw)
-            if parsed is None:
+    for segment in segments:
+        if not isinstance(segment, dict):
+            skipped[0] += 1
+            continue
+        seconds = _coerce_seconds(segment.get("start"))
+        if seconds is None:
+            skipped[0] += 1
+            continue
+        text = _segment_text(segment)
+        overlap = _token_set(text) & query_tokens
+        if not overlap:
+            continue
+        score = len(overlap) / len(query_tokens)
+        hits.append(Hit(seconds, "speech", text, score))
+    return hits
+
+
+def _segment_text(segment: dict[str, object]) -> str:
+    """Return a segment's text, prefixed with the speaker when present."""
+    text = segment.get("text", "")
+    text = text if isinstance(text, str) else ""
+    speaker = segment.get("speaker")
+    if isinstance(speaker, str) and speaker.strip():
+        return f"{speaker.strip()}: {text}"
+    return text
+
+
+def _ocr_hits(
+    entry: Path, query_tokens: frozenset[str], skipped: list[int]
+) -> list[Hit]:
+    """Return `ocr` hits from every `<entry>/ocr/*.json` record.
+
+    Files are visited in sorted name order, records in file order, so the
+    collection order feeding the stable sort is deterministic. An OCR file
+    may hold a single record object or a list of them. A malformed file, a
+    non-dictionary record, a missing or unusable timestamp, or a non-string
+    text counts as one skip.
+    """
+    ocr_dir = entry / "ocr"
+    if not ocr_dir.is_dir():
+        return []
+    hits: list[Hit] = []
+    for path in sorted(ocr_dir.glob("*.json")):
+        try:
+            data: Any = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            skipped[0] += 1
+            continue
+        records = data if isinstance(data, list) else [data]
+        for record in records:
+            if not isinstance(record, dict):
+                skipped[0] += 1
                 continue
-            timestamp, layer, payload = parsed
-            if layer not in wanted:
+            seconds = _coerce_seconds(record.get("timestamp"))
+            text = record.get("text", "")
+            if seconds is None or not isinstance(text, str):
+                skipped[0] += 1
                 continue
-            overlap = _token_set(payload) & query_tokens
+            overlap = _token_set(text) & query_tokens
             if not overlap:
                 continue
             score = len(overlap) / len(query_tokens)
-            hits.append(Hit(timestamp, layer, payload, score))
-    hits.sort(key=lambda hit: (-hit.score, hit.timestamp))
-    return hits[:limit]
+            hits.append(Hit(seconds, "ocr", text, score))
+    return hits
+
+
+def _coerce_seconds(value: object) -> float | None:
+    """Coerce an artifact's timestamp value to seconds, or None.
+
+    Accepts epoch-style numbers and the project's `HH:MM:SS.mmm` form; a
+    boolean or anything unparseable is `None`.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        stamped = _split_timeline_line(f"[{value}] layer | payload")
+        if stamped is not None:
+            return stamped[0]
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _split_timeline_line(raw: str) -> tuple[float, str, str] | None:
