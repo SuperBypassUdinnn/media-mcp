@@ -8,15 +8,26 @@ layer raises. External tools are invoked with argument lists, never through a
 shell, and stderr is captured and reported in the error message, never echoed
 to the console. ffprobe output is read only as JSON, never as human-readable
 text, so a changed banner can never break the parse.
+
+Heavy commands (scene scans, frame extraction, OCR, transcription) run through
+`run_child`: the child leads its own process group so a timeout or a cancel
+event can take down the whole process tree, and streams are capped so a
+runaway command cannot exhaust memory.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Generic, TypeVar
+
+_PayloadT_co = TypeVar("_PayloadT_co", covariant=True)
 
 # The refusal thresholds of the design document, exposed here as plain module
 # constants. Nothing in this module reads the environment; Task 11 wires the
@@ -29,6 +40,21 @@ _WARN_FRACTION = 0.5
 
 # String values ffprobe emits for numbers it could not measure.
 _NOT_A_NUMBER = frozenset({"N/A", "NA", "MISSING", "?", "-", ""})
+
+# Run_child's per-stream capture cap and the marker it appends when a stream
+# exceeds it. The cap is generous for the tool outputs in this project (ffmpeg
+# scene reports, OCR text, transcript text) while still bounding a runaway
+# child's memory: at most 8 MiB of stdout plus 8 MiB of stderr are retained,
+# and everything past the cap is drained and discarded, never buffered.
+_STREAM_CAPTURE_LIMIT = 8 * 1024**2
+_TRUNCATION_MARKER = "...[output truncated]..."
+
+# How long a SIGTERM'd group gets to exit before SIGKILL lands.
+_KILL_GRACE_SECONDS = 2.0
+# Poll cadence while waiting on the deadline or the cancel event.
+_POLL_SECONDS = 0.05
+# How large a chunk each reader thread pulls from a stream pipe.
+_READ_CHUNK_BYTES = 64 * 1024
 
 
 class MediaError(RuntimeError):
@@ -64,6 +90,27 @@ class ProbeResult:
     has_audio: bool
     audio_offset: float
     size_bytes: int
+
+
+@dataclass(frozen=True)
+class CompletedProcess(Generic[_PayloadT_co]):
+    """What one child process did, immune to post-hoc mutation.
+
+    Fields are the brief's exactly: `returncode` in the usual Popen sense,
+    `stdout`/`stderr` as captured text (each capped at
+    `_STREAM_CAPTURE_LIMIT` with the `_TRUNCATION_MARKER` appended once when
+    a stream exceeded the cap), and the two stop flags. A deadline stop or a
+    cancellation raises `MediaError` instead of returning — its message
+    reports which signal finished the group — so `timed_out` is False in
+    every returned result; `killed` is true only when SIGKILL escalation was
+    needed, i.e. a descendant still holding the pipes after a normal exit.
+    """
+
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool
+    killed: bool
 
 
 def validate_source(source: str, allowed_roots: list[Path] | None = None) -> Path:
@@ -172,6 +219,182 @@ def source_limits(result: ProbeResult) -> dict[str, bool]:
         "warn": seconds_warn or bytes_warn,
         "refuse": seconds_refuse or bytes_refuse,
     }
+
+
+def run_child(
+    argv: list[str],
+    timeout_seconds: int = 900,
+    cancel: threading.Event | None = None,
+) -> CompletedProcess[str]:
+    """Run `argv` in its own process group and return its bounded output.
+
+    The child starts with `start_new_session=True`, so it leads a fresh
+    process group: killing the group takes the whole process tree down, not
+    just the direct child, and an orphaned ffmpeg can never outlive the call
+    that started it. When the deadline passes or `cancel` is set (whichever
+    comes first), SIGTERM is sent to the group, the group gets a two-second
+    grace period to exit, and SIGKILL lands on anything that survives. The
+    error message names `argv`, the elapsed time, and which of the two
+    signals finished the group (`SIGTERM was enough` or `SIGKILL was needed
+    after the SIGTERM grace period`).
+
+    stdout and stderr are captured separately as text, each capped at
+    `_STREAM_CAPTURE_LIMIT` (8 MiB) with the `_TRUNCATION_MARKER` appended
+    once past the cap; overflow is drained and discarded, not buffered, so a
+    chatty child cannot exhaust memory. A non-zero exit code is data and is
+    returned in `returncode`; this machine's ffmpeg tools print `Fontconfig`
+    noise on stderr while succeeding, so only the exit code decides success.
+    `MediaError` is raised for a stop (timeout or cancellation) and for a
+    process that could not start at all — a missing binary, naming the binary
+    and the OS error.
+    """
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as err:
+        raise MediaError(f"could not start {argv[0]}: {err}; argv: {argv}") from err
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    readers = [
+        thread
+        for stream, sink in (
+            (process.stdout, stdout_chunks),
+            (process.stderr, stderr_chunks),
+        )
+        if (thread := _drain(stream, sink)) is not None
+    ]
+
+    deadline = started + timeout_seconds
+    trigger = ""
+    while process.poll() is None:
+        if cancel is not None and cancel.is_set():
+            trigger = "cancelled"
+            break
+        if time.monotonic() >= deadline:
+            trigger = "timeout"
+            break
+        time.sleep(_POLL_SECONDS)
+
+    killed = False
+    if trigger:
+        killed = _stop_group(process)
+
+    for reader in readers:
+        reader.join(timeout=_KILL_GRACE_SECONDS)
+    # A grandchild that inherited a pipe can hold its reader open past the
+    # process's exit; force the group down so the call cannot hang and no
+    # stray process outlives it. The escalation is recorded in `killed`.
+    if any(reader.is_alive() for reader in readers):
+        killed = True
+        _signal_group(process.pid, signal.SIGKILL)
+        for reader in readers:
+            reader.join(timeout=_KILL_GRACE_SECONDS)
+
+    stdout, stderr = "".join(stdout_chunks), "".join(stderr_chunks)
+    if trigger == "timeout":
+        elapsed = time.monotonic() - started
+        raise MediaError(
+            f"timeout: {argv[0]} was stopped after {elapsed:.1f}s "
+            f"(limit {timeout_seconds}s; {_stop_report(killed)}); argv: {argv}; "
+            f"captured stderr: {stderr.strip() or '(none)'}"
+        )
+    if trigger == "cancelled":
+        elapsed = time.monotonic() - started
+        raise MediaError(
+            f"cancel: {argv[0]} was stopped after {elapsed:.1f}s, before its "
+            f"timeout ({_stop_report(killed)}); argv: {argv}; captured stderr: "
+            f"{stderr.strip() or '(none)'}"
+        )
+    return CompletedProcess(
+        returncode=process.returncode or 0,
+        stdout=stdout,
+        stderr=stderr,
+        timed_out=False,
+        killed=killed,
+    )
+
+
+def _stop_report(killed: bool) -> str:
+    """Name the signal that finished the group, for the stop error message.
+
+    The observable half of the runner's `killed` flag: since a stop raises,
+    the message reports whether SIGTERM alone sufficed or SIGKILL escalation
+    was needed after the grace period.
+    """
+    if killed:
+        return "SIGKILL was needed after the SIGTERM grace period"
+    return "SIGTERM was enough"
+
+
+def _stop_group(process: subprocess.Popen[str]) -> bool:
+    """SIGTERM `process`'s group, grace-wait, SIGKILL whatever survives.
+
+    Returns whether SIGKILL escalation was needed; that boolean feeds the
+    runner's `killed` field. The group signal binds any grandchild that
+    inherited the session, so no orphan survives `run_child`.
+    """
+    _signal_group(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=_KILL_GRACE_SECONDS)
+        return False
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_group(process.pid, signal.SIGKILL)
+    try:
+        process.wait(timeout=_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    return True
+
+
+def _signal_group(pid: int, sig: signal.Signals) -> None:
+    """Signal `pid`'s process group, ignoring an already-gone group."""
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _drain(stream: object, sink: list[str]) -> threading.Thread | None:
+    """Spawn a reader thread appending `stream` chunks into `sink`, capped.
+
+    Returns the started daemon thread, or None when the stream is not a text
+    pipe (not expected with the pipes `run_child` opens but harmless by
+    construction). Once the limit is reached, chunks are drained and discarded
+    so the child never blocks on a full pipe, and the truncation marker is
+    appended exactly once per stream.
+    """
+    if stream is None:
+        return None
+
+    def _append_capped() -> None:
+        grabbed = 0
+        truncated = False
+        for chunk in iter(lambda: stream.read(_READ_CHUNK_BYTES), ""):
+            if truncated:
+                continue
+            if grabbed + len(chunk) > _STREAM_CAPTURE_LIMIT:
+                room = _STREAM_CAPTURE_LIMIT - grabbed
+                if room:
+                    sink.append(chunk[:room])
+                grabbed = _STREAM_CAPTURE_LIMIT
+                sink.append(_TRUNCATION_MARKER)
+                truncated = True
+            else:
+                sink.append(chunk)
+                grabbed += len(chunk)
+        stream.close()
+
+    reader = threading.Thread(target=_append_capped, daemon=True)
+    reader.start()
+    return reader
 
 
 def _is_relative_to(child: Path, root: Path) -> bool:
