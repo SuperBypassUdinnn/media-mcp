@@ -147,6 +147,43 @@ def make_audio_only(path: Path) -> Path:
     return path
 
 
+def make_silent_audio(path: Path, *, duration: int = 4) -> Path:
+    """Write an audio-only file of digital silence.
+
+    `make_silent_video` also carries an `anullsrc` track, but its mp4
+    container decodes its silent audio to `3.989333` seconds, inside the 4.0 s
+    probe duration. An audio-only m4a decodes past its container duration
+    (measured `4.010667` for a 4.0 s file), which is exactly the edge where a
+    silence pair must still close at the probed duration. This builder exists
+    so that shape is covered without a video stream.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"anullsrc=channel_layout=mono:sample_rate={AUDIO_RATE}",
+            "-t",
+            str(duration),
+            "-vn",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            str(path),
+        ]
+    )
+    return path
+
+
 def make_audio_gap(
     path: Path,
     *,

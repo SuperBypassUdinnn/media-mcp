@@ -35,7 +35,8 @@ def test_bounded_silent_stretch_yields_a_bracketing_pair(tmp_path):
     assert abs(ends[0].timestamp - 3.0) <= 0.5, ends[0].timestamp
     assert starts[0].timestamp < ends[0].timestamp
     assert starts[0].timestamp <= 2.5 <= ends[0].timestamp
-    assert ends[0].detail.startswith("silence duration 00:00:01"), ends[0].detail
+    assert starts[0].detail == "00:00:02.005", starts[0].detail
+    assert ends[0].detail == "00:00:01.003", ends[0].detail
     _assert_ordered_and_bounded(events, duration=6.0)
 
 
@@ -64,12 +65,64 @@ def test_noise_db_above_the_file_level_removes_the_loud_event(tmp_path):
     assert any(event.kind == "loud" for event in default), default
 
     # The fixture's loudest peak measures about -4 dB, so 0 dB sits above every
-    # level in the file: silencedetect then calls the whole clip silent and no
-    # frame may still be promoted to a loud peak.
+    # level in the file and the peak rule's absolute gate drops the spike. The
+    # silence side of a raised gate is asserted on an audio-only tone in
+    # test_noise_db_turns_an_audible_source_into_one_cover_all_pair, because
+    # this fixture already carries silence segments at the default thresholds.
     raised = media.detect_audio_events(sample, noise_db=0.0)
-    assert raised, "the raised gate must still report the whole clip as silence"
     assert not any(event.kind == "loud" for event in raised), raised
     assert {event.kind for event in raised} <= {"silence_start", "silence_end"}
+
+
+def test_silent_audio_only_source_reports_one_cover_all_pair(tmp_path):
+    clip = fixtures.make_silent_audio(tmp_path / "silent.m4a", duration=4)
+    result = media.probe(clip)
+    events = media.detect_audio_events(clip)
+    assert [(event.kind, event.timestamp) for event in events] == [
+        ("silence_start", 0.0),
+        ("silence_end", result.duration),
+    ]
+    # The decoded silent tail runs past the container (4.010667 s for a 4.0 s
+    # file); the pair must still close at the probed duration rather than lose
+    # its end and leave the start dangling.
+    assert events[1].timestamp == result.duration
+
+
+def test_trailing_silence_pair_closes_inside_the_probed_duration(tmp_path):
+    clip = fixtures.make_audio_gap(
+        tmp_path / "tail.m4a", duration=6, gap_at=4.5, gap_seconds=1.5
+    )
+    result = media.probe(clip)
+    events = media.detect_audio_events(clip)
+    assert [event.kind for event in events] == ["silence_start", "silence_end"]
+    start, end = events
+    assert 0.0 <= start.timestamp < end.timestamp <= result.duration
+    assert start.timestamp >= 4.0
+    assert end.timestamp == result.duration
+
+
+def test_noise_db_turns_an_audible_source_into_one_cover_all_pair(tmp_path):
+    clip = fixtures.make_audio_gap(tmp_path / "gap.m4a", duration=6)
+    result = media.probe(clip)
+    default = media.detect_audio_events(clip)
+    assert [event.kind for event in default] == ["silence_start", "silence_end"]
+    assert default[0].timestamp < 2.5 < default[1].timestamp
+
+    # The tone peaks around -12 dB, so the raised gate makes the whole clip
+    # silent. If noise_db were not passed to the filter, the pair would still
+    # bracket only the gap; if the pair were filtered per event, the end past
+    # the container duration would vanish.
+    raised = media.detect_audio_events(clip, noise_db=0.0)
+    assert [(event.kind, event.timestamp) for event in raised] == [
+        ("silence_start", 0.0),
+        ("silence_end", result.duration),
+    ]
+
+
+def test_min_silence_longer_than_the_gap_removes_the_pair(tmp_path):
+    clip = fixtures.make_audio_gap(tmp_path / "gap.m4a", duration=6)
+    events = media.detect_audio_events(clip, min_silence=2.0)
+    assert not any(event.kind.startswith("silence") for event in events), events
 
 
 def _assert_ordered_and_bounded(events, duration):

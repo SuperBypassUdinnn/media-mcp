@@ -230,13 +230,14 @@ class SceneScore:
 class AudioEvent:
     """One moment of the audio timeline: a silence boundary or a loud peak.
 
-    `timestamp` is the media-time second the event marks, `kind` is one of
-    `"silence_start"`, `"silence_end"`, or `"loud"`, and `detail` carries the
-    measured evidence in readable form: silencedetect's own reported start
-    seconds, the measured silence duration as `HH:MM:SS.mmm`, or a peak's
-    level against the file's own baseline. The objects satisfy the shape
-    `rank_candidates` accepts, because `_audio_event_timestamp` reads the
-    `timestamp` attribute directly.
+    `timestamp` is the media-time second the event marks, and `kind` is one
+    of `"silence_start"`, `"silence_end"`, or `"loud"`. `detail` carries the
+    measurement in readable form without repeating the kind: the start's
+    position and the end's measured span are both `HH:MM:SS.mmm` values from
+    `artifacts.format_timestamp`, so a table can render them side by side; a
+    loud event's detail is its level against the file's own baseline. The
+    objects satisfy the shape `rank_candidates` accepts, because
+    `_audio_event_timestamp` reads the `timestamp` attribute directly.
     """
 
     timestamp: float
@@ -448,13 +449,29 @@ def detect_audio_events(
     being checked cosmetically afterwards.
 
     Each silence segment yields a `silence_start` at its beginning and a
-    `silence_end` at its end; a segment still open at end of stream closes
-    at the probed duration, and an end line without a start is skipped
-    because it cannot be placed. Loudness yields one `loud` event per run
-    of consecutive analysis frames whose peak clears the file's own median
-    frame level by `_LOUD_MARGIN_DB` and the caller's noise gate. Events
-    are ordered by timestamp, and timestamps are non-negative and never
-    beyond the probed duration.
+    `silence_end` at its end. The pair is clamped as a unit to the probed
+    duration before it becomes events, because decoded audio can run past
+    the container (an AAC audio-only source measured a silent tail ending at
+    `4.010667` for a 4.0-second file); filtering the two boundaries
+    separately would drop the end and leave a silence that never closes. A
+    segment that is empty after clamping, or lies entirely past the
+    duration, contributes both events or neither. A segment still open at
+    end of stream closes at the probed duration, and an end line without a
+    start is skipped because it cannot be placed.
+
+    Loudness yields one `loud` event per run of consecutive analysis frames
+    whose peak clears the file's own median frame level by
+    `_LOUD_MARGIN_DB` and the caller's noise gate. That rule is deliberately
+    conservative: because the gate is absolute, a quiet but dynamic
+    recording can report no peak at all, and because the median carries the
+    baseline, loud frames filling more than half the analysis frames make
+    the median itself loud, so nothing clears the margin. An empty loudness
+    list therefore means "no peak under this rule", not "no loud moment".
+
+    Events are ordered by timestamp, and timestamps are non-negative and
+    never beyond the probed duration. Silence details are `HH:MM:SS.mmm`
+    values (the start's position, the end's span), and a loud detail carries
+    its level against the baseline.
 
     A source with no audio stream returns `[]` before any filter runs, and
     a source with nothing to report also returns `[]` rather than raising.
@@ -493,71 +510,85 @@ def detect_audio_events(
             f"{done.returncode}; captured stderr: {done.stderr.strip() or '(none)'}"
         )
     events = _silence_events(done.stderr, result.duration)
-    events += _loud_events(_astats_frames(done.stdout), noise_db)
-    bounded = [event for event in events if 0.0 <= event.timestamp <= result.duration]
-    bounded.sort(key=lambda event: event.timestamp)
-    return bounded
+    events += [
+        event
+        for event in _loud_events(_astats_frames(done.stdout), noise_db)
+        if 0.0 <= event.timestamp <= result.duration
+    ]
+    events.sort(key=lambda event: event.timestamp)
+    return events
 
 
 def _silence_events(stderr: str, duration: float) -> list[AudioEvent]:
-    """Pair silencedetect's start and end lines into two events per segment.
+    """Pair silencedetect's boundaries into two events per clamped segment.
 
-    A start line is held until its matching end line arrives; the start
-    event carries the filter's own reported seconds in `detail` and the end
-    event the measured duration as `HH:MM:SS.mmm`. When the end line omits
-    a duration, the boundary difference is used instead. A start still open
-    at end of stream is closed at the probed `duration`, which is how a
-    source that ends while silent still reports its trailing segment; an
-    end without a start has no beginning to report and is skipped. Lines of
-    any other shape (banners, progress, astats noise) are ignored.
+    A start line is held until its matching end line arrives; the pair then
+    goes through `_silence_pair`, which clamps both boundaries to the probed
+    `duration` together. Clamping as a unit is what keeps a decoded tail past
+    the container from losing only its end: an audio-only AAC source whose
+    silent content decodes to `4.010667` seconds of a 4.0-second file still
+    closes at `4.0` instead of leaving a silence that never ends. A start
+    still open at end of stream is closed at `duration`, and an end without a
+    start has no beginning to place and is skipped. Lines of any other shape
+    (banners, progress, astats noise) are ignored.
     """
     events: list[AudioEvent] = []
     open_start: float | None = None
-    open_reported = ""
     for line in stderr.splitlines():
         started = _SILENCE_START.search(line)
         if started is not None:
             open_start = float(started.group("time"))
-            open_reported = started.group("time")
             continue
         ended = _SILENCE_END.search(line)
         if ended is None or open_start is None:
             continue
-        stop = float(ended.group("time"))
-        measured = ended.group("duration")
-        span = float(measured) if measured is not None else stop - open_start
-        events.append(
-            AudioEvent(
-                timestamp=open_start,
-                kind="silence_start",
-                detail=f"silence_start {open_reported}s",
-            )
-        )
-        events.append(
-            AudioEvent(
-                timestamp=stop,
-                kind="silence_end",
-                detail=f"silence duration {format_timestamp(span)}",
+        events.extend(
+            _silence_pair(
+                open_start,
+                float(ended.group("time")),
+                ended.group("duration"),
+                duration,
             )
         )
         open_start = None
-        open_reported = ""
-    if open_start is not None and duration > open_start:
-        events.append(
-            AudioEvent(
-                timestamp=open_start,
-                kind="silence_start",
-                detail=f"silence_start {open_reported}s",
-            )
-        )
-        events.append(
-            AudioEvent(
-                timestamp=duration,
-                kind="silence_end",
-                detail=(f"silence duration {format_timestamp(duration - open_start)}"),
-            )
-        )
+    if open_start is not None:
+        events.extend(_silence_pair(open_start, duration, None, duration))
     return events
+
+
+def _silence_pair(
+    start: float, stop: float, reported: str | None, duration: float
+) -> list[AudioEvent]:
+    """Clamp one silence segment to the probed duration and build its events.
+
+    Both boundaries clamp into `[0.0, duration]` before anything is emitted,
+    and a segment whose clamped stop is at or before its clamped start yields
+    an empty list, so the start and end are always kept or dropped as a unit.
+    The end detail prefers the filter's own `silence_duration` when clamping
+    did not alter the boundaries, and the clamped span otherwise, which keeps
+    a tail cut short by the container honest. Both details are
+    `HH:MM:SS.mmm` positions/spans, never the kind repeated.
+    """
+    clamped_start = min(max(start, 0.0), duration)
+    clamped_stop = min(max(stop, 0.0), duration)
+    if clamped_stop <= clamped_start:
+        return []
+    if reported is not None and clamped_start == start and clamped_stop == stop:
+        span = float(reported)
+    else:
+        span = clamped_stop - clamped_start
+    return [
+        AudioEvent(
+            timestamp=clamped_start,
+            kind="silence_start",
+            detail=format_timestamp(clamped_start),
+        ),
+        AudioEvent(
+            timestamp=clamped_stop,
+            kind="silence_end",
+            detail=format_timestamp(span),
+        ),
+    ]
 
 
 def _astats_frames(stdout: str) -> list[tuple[float, float]]:
@@ -600,6 +631,12 @@ def _loud_events(
     no peak to report. Consecutive qualifying frames are one peak, reported
     at the first frame's timestamp with the run's highest level and its
     margin over the baseline in `detail`.
+
+    Both conditions are limits on purpose: a quiet recording whose clear
+    relative peak stays below the absolute gate reports nothing, and a clip
+    whose loud frames fill more than half the analysis frames makes the
+    median itself loud, so no frame clears the margin. An empty list is a
+    result of this rule, not evidence that nothing was loud.
     """
     if not frames:
         return []
