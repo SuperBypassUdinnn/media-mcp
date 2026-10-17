@@ -7,7 +7,11 @@ file into a `ProbeResult`, and `MediaError` is the error type the whole server
 layer raises. External tools are invoked with argument lists, never through a
 shell, and stderr is captured and reported in the error message, never echoed
 to the console. ffprobe output is read only as JSON, never as human-readable
-text, so a changed banner can never break the parse.
+text, so a changed banner can never break the parse. The same module decides
+which frames are worth rasterizing at all: `detect_scenes` scores hard cuts,
+`sample_candidates` merges them with interval ticks and collapses near
+duplicates by perceptual hash, and `rank_candidates` spends the caller's
+frame budget with a complete reason accounting.
 
 Heavy commands (scene scans, frame extraction, OCR, transcription) run through
 `run_child`: the child leads its own process group so a timeout or a cancel
@@ -17,15 +21,19 @@ runaway command cannot exhaust memory.
 
 from __future__ import annotations
 
+import codecs
+import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Generic, TypeVar
+from typing import BinaryIO, Generic, TypeVar
 
 _PayloadT_co = TypeVar("_PayloadT_co", covariant=True)
 
@@ -55,6 +63,34 @@ _KILL_GRACE_SECONDS = 2.0
 _POLL_SECONDS = 0.05
 # How large a chunk each reader thread pulls from a stream pipe.
 _READ_CHUNK_BYTES = 64 * 1024
+
+# The frame-rasterization sampler's own constants, unprefixed module names by
+# the project's "one module, named constants" resolution: no environment
+# variable is read anywhere in this file. Fixed-interval ticks land every
+# `interval` seconds across a clip, and two candidates whose extracted
+# perceptual hashes sit within `dedup_distance` Hamming bits count as the
+# same picture and collapse to one survivor.
+interval = 3
+dedup_distance = 6
+# Hash width diff_hash_of guarantees, and its comparison mask.
+_HASH_BITS = 64
+_HASH_MASK = (1 << _HASH_BITS) - 1
+
+# The diff-hash raster shape: 32x32 one byte per gray pixel.
+_GRAY_SIZE = 32
+
+# ffmpeg's scdet report shape on stderr, matched tolerantly: lines that do
+# not match are ignored, everything else (banners, progress, Fontconfig
+# noise) is skipped. Scores are opaque detector units, never rescaled here.
+_SCD_LINE = re.compile(
+    r"lavfi\.scd\.score:\s*(?P<score>[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"
+    r"\s*,\s*lavfi\.scd\.time:\s*(?P<time>[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"
+)
+
+# Candidate reasons in ranking-priority order: the tuple index is the sort
+# weight, so `scene` beats `audio` beats `interval` beats `fill`.
+_REASON_PRIORITY = {"scene": 0, "audio": 1, "interval": 2, "fill": 3}
+_RANKING_REASONS = ("scene", "audio", "interval", "fill")
 
 
 class MediaError(RuntimeError):
@@ -90,6 +126,38 @@ class ProbeResult:
     has_audio: bool
     audio_offset: float
     size_bytes: int
+
+
+@dataclass(frozen=True)
+class SceneScore:
+    """What ffmpeg's `scdet` filter reported for one media second.
+
+    `timestamp` is the candidate second on the media timeline and `score` is
+    the detector's raw evidence in its own units — not normalized to 0..1:
+    continuous testsrc motion measured about 0.5 on this machine while a
+    genuine hard cut measured 34.845. Nothing here rescales, clamps, or
+    thresholds; the caller's threshold lives in the same units.
+    """
+
+    timestamp: float
+    score: float
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One timestamp worth rasterizing into a frame image.
+
+    `reason` explains why the timestamp was picked: `"scene"` for an scdet
+    boundary, `"audio"` for an audio event, `"interval"` for a fixed grid
+    tick, `"fill"` for a synthesized gap filler. `score` carries the pick's
+    evidence — the scene score in scdet's raw units, 0.0 elsewhere — and
+    ranking reads it after the reason priority, never before, so the result
+    stays reproducible top to bottom.
+    """
+
+    timestamp: float
+    reason: str
+    score: float
 
 
 @dataclass(frozen=True)
@@ -221,10 +289,210 @@ def source_limits(result: ProbeResult) -> dict[str, bool]:
     }
 
 
+def detect_scenes(path: Path, threshold: float = 10.0) -> list[SceneScore]:
+    """Score the hard cuts of `path` with ffmpeg's `scdet` filter.
+
+    Runs `ffmpeg -i <path> -vf scdet=threshold=<t> -f null -` through
+    `run_child` and parses the `lavfi.scd.score: <score>, lavfi.scd.time:
+    <second>` lines ffmpeg writes on stderr, tolerantly: lines with another
+    shape (banners, progress, Fontconfig noise) are ignored, since stderr
+    content alone is never failure. `threshold` is formatted as a plain
+    decimal in the filter string, never scientific notation, and the scores
+    come back untouched in the detector's own units, at most one per media
+    second in ascending order. A non-zero ffmpeg exit raises `MediaError`
+    naming the path; a clip with nothing above the threshold yields no
+    score lines at all, and that empty result returns `[]` — legitimate,
+    not an error.
+    """
+    path = Path(path)
+    argv = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-i",
+        str(path),
+        "-vf",
+        f"scdet=threshold={_plain_decimal(threshold)}",
+        "-f",
+        "null",
+        "-",
+    ]
+    done = run_child(argv)
+    if done.returncode != 0:
+        raise MediaError(
+            f"scene detection failed for {path}: ffmpeg exited "
+            f"{done.returncode}; captured stderr: {done.stderr.strip() or '(none)'}"
+        )
+    return [
+        SceneScore(
+            timestamp=float(match.group("time")), score=float(match.group("score"))
+        )
+        for match in _SCD_LINE.finditer(done.stderr)
+    ]
+
+
+def diff_hash_of(raw: bytes) -> int:
+    """Digest raw bytes into a stable 64-bit integer.
+
+    Pure and testable without a video: the same bytes always digest to the
+    same value, distinct bytes almost never collide, and the digest is
+    stable across processes — blake2b, not a salted builtin hash — so
+    `hamming` comparisons stay honest between calls and runs. Standard
+    library only; nothing more is needed by design.
+    """
+    return int.from_bytes(
+        hashlib.blake2b(raw, digest_size=_HASH_BITS // 8).digest(), "big"
+    )
+
+
+def hamming(a: int, b: int) -> int:
+    """Count the differing bits of two 64-bit digests, bounded by 0..64.
+
+    The XOR is masked to the hash width first, so inputs wider than
+    `diff_hash_of`'s product are truncated like the digest space they claim
+    to compare: bigger arguments can never report more than 64 differing
+    bits.
+    """
+    return ((a ^ b) & _HASH_MASK).bit_count()
+
+
+def diff_hash(png_bytes: bytes) -> int:
+    """Hash a PNG frame after a 32x32 grayscale downscale through ffmpeg.
+
+    The image travels into the child's stdin (`-f image2pipe`) and a
+    one-byte-per-pixel gray raster comes out of stdout (`-f rawvideo`), so
+    the trip never touches a temporary file and never adds an image
+    library: the raster's 1024 raw bytes feed `diff_hash_of` directly, and
+    bytes survive the text-typed child result through `run_child`'s
+    latin-1 bijection. A non-zero ffmpeg exit or an empty raster raises
+    `MediaError` — a malformed PNG is the caller's broken frame, named as
+    such.
+    """
+    argv = [
+        "ffmpeg",
+        "-hide_banner",
+        "-f",
+        "image2pipe",
+        "-c:v",
+        "png",
+        "-i",
+        "-",
+        "-frames:v",
+        "1",
+        "-vf",
+        f"scale={_GRAY_SIZE}:{_GRAY_SIZE}",
+        "-pix_fmt",
+        "gray",
+        "-f",
+        "rawvideo",
+        "-",
+    ]
+    done = run_child(argv, stdin_bytes=png_bytes)
+    raster = done.stdout.encode("latin-1")
+    if done.returncode != 0 or not raster:
+        raise MediaError(
+            "diff_hash could not downscale a frame to "
+            f"{_GRAY_SIZE}x{_GRAY_SIZE} gray: ffmpeg exited "
+            f"{done.returncode}; captured stderr: {done.stderr.strip() or '(none)'}"
+        )
+    return diff_hash_of(raster)
+
+
+def sample_candidates(
+    scenes: list[SceneScore],
+    duration: float,
+    interval: float = 3,
+    dedup_distance: int = 6,
+    extract: Callable[[float], int] = lambda t: 0,
+) -> list[Candidate]:
+    """Merge scene boundaries and interval ticks into deduped candidates.
+
+    Scene scores arrive first as `"scene"` candidates carrying their scdet
+    evidence, then fixed-interval ticks are laid across `duration` every
+    `interval` seconds starting at zero as `"interval"` candidates at score
+    0.0. Everything coalesces in timestamp order, and consecutive runs
+    within `dedup_distance` Hamming bits of the run's anchor — per
+    `extract(timestamp)`, the caller's perceptual peek at each frame —
+    collapse into one survivor: the highest-priority reason, then the
+    highest score, then the earliest timestamp, deterministically. With no
+    scenes, interval 1 across 10 seconds, and one constant hash, exactly
+    one tick survives: the earliest. Nothing rasterizes here; `extract` is
+    a sampling stub — the video-side caller plugs `diff_hash` over real
+    frames in later tasks.
+    """
+    candidates: list[Candidate] = [
+        Candidate(
+            timestamp=float(scene.timestamp), reason="scene", score=float(scene.score)
+        )
+        for scene in scenes
+    ]
+    step = float(interval)
+    if step > 0.0:
+        tick = 0.0
+        while tick < duration:
+            candidates.append(Candidate(timestamp=tick, reason="interval", score=0.0))
+            tick += step
+    candidates.sort(
+        key=lambda candidate: (candidate.timestamp, _REASON_PRIORITY[candidate.reason])
+    )
+    hashes = [extract(candidate.timestamp) for candidate in candidates]
+
+    kept: list[Candidate] = []
+    run_start = 0
+    while run_start < len(candidates):
+        anchor_hash = hashes[run_start]
+        run_end = run_start + 1
+        while run_end < len(candidates) and (
+            hamming(hashes[run_end], anchor_hash) <= dedup_distance
+        ):
+            run_end += 1
+        kept.append(min(candidates[run_start:run_end], key=_candidate_key))
+        run_start = run_end
+    return kept
+
+
+def rank_candidates(
+    candidates: list[Candidate],
+    audio_events: list[object],
+    budget: int = 120,
+) -> tuple[list[Candidate], dict[str, int]]:
+    """Spend the frame budget on the best candidates and account for the rest.
+
+    `audio_events` may be plain timestamps or objects carrying a timestamp
+    (attribute or mapping key) — both are accepted, an unparsable event is
+    skipped without crashing, and an empty list invents nothing. The merged
+    list sorts by reason priority (scene > audio > interval > fill), then
+    score descending, then timestamp ascending, and the first `budget`
+    candidates are kept, so the result is reproducible. While the kept set
+    leaves room under `budget`, the widest time gaps between the kept
+    timestamps, each at least twice the sampler's `interval` wide, gain one
+    `"fill"` candidate at the gap midpoint: synthesized fill never
+    displaces a real candidate and never appears when there is nothing to
+    fill (no real candidates, no wide gap, or no room). The accounting
+    counts every kept reason plus `"dropped"`, so the four reason counts
+    always sum to the number kept.
+    """
+    seed = list(candidates)
+    for event in audio_events:
+        timestamp = _audio_event_timestamp(event)
+        if timestamp is not None:
+            seed.append(Candidate(timestamp=timestamp, reason="audio", score=0.0))
+    seed.sort(key=_candidate_key)
+    kept = seed[: max(0, budget)]
+    ranked = sorted(kept + _gap_fills(kept, budget), key=_candidate_key)
+    accounting: dict[str, int] = dict.fromkeys(_RANKING_REASONS, 0)
+    accounting["dropped"] = len(seed) - len(kept)
+    for candidate in ranked:
+        if candidate.reason in accounting:
+            accounting[candidate.reason] += 1
+    return ranked, accounting
+
+
 def run_child(
     argv: list[str],
     timeout_seconds: int = 900,
     cancel: threading.Event | None = None,
+    stdin_bytes: bytes | None = None,
 ) -> CompletedProcess[str]:
     """Run `argv` in its own process group and return its bounded output.
 
@@ -241,32 +509,56 @@ def run_child(
     stdout and stderr are captured separately as text, each capped at
     `_STREAM_CAPTURE_LIMIT` (8 MiB) with the `_TRUNCATION_MARKER` appended
     once past the cap; overflow is drained and discarded, not buffered, so a
-    chatty child cannot exhaust memory. A non-zero exit code is data and is
-    returned in `returncode`; this machine's ffmpeg tools print `Fontconfig`
-    noise on stderr while succeeding, so only the exit code decides success.
-    `MediaError` is raised for a stop (timeout or cancellation) and for a
-    process that could not start at all — a missing binary, naming the binary
-    and the OS error.
+    chatty child cannot exhaust memory. When `stdin_bytes` is given, the
+    child reads that payload from a piped stdin closed after the last byte,
+    and its stdout is decoded one byte per `latin-1` code point — a strict
+    bijection, so a binary stdout stream (the diff-hash gray raster) is
+    recoverable exactly with `stdout.encode("latin-1")` — while stderr stays
+    UTF-8 with replacements for readable diagnostics; without `stdin_bytes`
+    the capture behaves exactly as before. A non-zero exit code is data and
+    is returned in `returncode`; this machine's ffmpeg
+    tools print `Fontconfig` noise on stderr while succeeding, so only the
+    exit code decides success. `MediaError` is raised for a stop (timeout or
+    cancellation) and for a process that could not start at all — a missing
+    binary, naming the binary and the OS error.
     """
     started = time.monotonic()
     try:
-        process = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+        if stdin_bytes is None:
+            process = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        else:
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
     except (OSError, ValueError) as err:
         raise MediaError(f"could not start {argv[0]}: {err}; argv: {argv}") from err
+
+    if stdin_bytes is None:
+        stdout_stream, stderr_stream = process.stdout, process.stderr
+    else:
+        stdout_stream = _TextPipe(process.stdout, codec="latin-1")
+        stderr_stream = _TextPipe(process.stderr, codec="utf-8")
+    writer = (
+        _feed_stdin(process.stdin, stdin_bytes) if stdin_bytes is not None else None
+    )
 
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
     readers = [
         thread
         for stream, sink in (
-            (process.stdout, stdout_chunks),
-            (process.stderr, stderr_chunks),
+            (stdout_stream, stdout_chunks),
+            (stderr_stream, stderr_chunks),
         )
         if (thread := _drain(stream, sink)) is not None
     ]
@@ -285,6 +577,12 @@ def run_child(
     killed = False
     if trigger:
         killed = _stop_group(process)
+
+    # The stdin feed runs alongside the child's own consumption: once the
+    # child exited or the group was stopped, a pipe that is still open was
+    # abandoned, the writer's next write breaks, and it closes itself out.
+    if writer is not None:
+        writer.join(timeout=_KILL_GRACE_SECONDS)
 
     for reader in readers:
         reader.join(timeout=_KILL_GRACE_SECONDS)
@@ -395,6 +693,139 @@ def _drain(stream: object, sink: list[str]) -> threading.Thread | None:
     reader = threading.Thread(target=_append_capped, daemon=True)
     reader.start()
     return reader
+
+
+class _TextPipe:
+    """Read a binary pipe as text so the bounded drain treats both alike.
+
+    `run_child`'s drain loop works in text, so a binary pipe (the stdin-fed
+    path) is wrapped: every chunk decodes through an incremental decoder.
+    With `latin-1` the decode is a strict per-byte bijection — every byte
+    becomes one code point and `text.encode("latin-1")` returns the exact
+    bytes — which is how a binary stdout stream survives the text-typed
+    `CompletedProcess` untouched. With `utf-8`, invalid sequences decay into
+    the replacement character instead of raising at a chunk boundary, which
+    keeps diagnostics readable. The incremental decoder carries a partial
+    multi-byte sequence across a chunk boundary instead of failing there.
+    """
+
+    def __init__(self, raw: BinaryIO, codec: str = "utf-8") -> None:
+        self._raw = raw
+        self._decoder = codecs.getincrementaldecoder(codec)()
+
+    def read(self, size: int) -> str:
+        """Return the next decoded text chunk, or "" at end of stream."""
+        return (
+            self._decoder.decode(raw_chunk)
+            if (raw_chunk := self._raw.read(size))
+            else ""
+        )
+
+    def close(self) -> None:
+        """Close the underlying pipe; closing twice is harmless."""
+        self._raw.close()
+
+
+def _feed_stdin(pipe: BinaryIO | None, payload: bytes) -> threading.Thread | None:
+    """Start a daemon thread writing `payload` to the child's stdin, closing it.
+
+    A payload larger than the pipe buffer must be written off the caller's
+    thread, or the child writing its stdout and the parent filling its stdin
+    can deadlock each holding a full pipe. The thread is the caller's
+    joinable handle, returned for the runner's shutdown bookkeeping. A child
+    that died before consuming stdin makes the next write fail; a broken or
+    already-closed pipe drains the error and closes.
+    """
+    if pipe is None:
+        return None
+
+    def _write_and_close() -> None:
+        try:
+            pipe.write(payload)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                pipe.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+    writer = threading.Thread(target=_write_and_close, daemon=True)
+    writer.start()
+    return writer
+
+
+def _candidate_key(candidate: Candidate) -> tuple[int, float, float]:
+    """Sort key ranking candidates: priority, score descending, time ascending.
+
+    The one comparison rule every ranked list here goes through, so results
+    are reproducible: `scene` beats `audio` beats `interval` beats `fill`,
+    then the stronger score wins, then the earlier timestamp — which makes
+    the winner of an exact tie deterministic (earliest).
+    """
+    return (_REASON_PRIORITY[candidate.reason], -candidate.score, candidate.timestamp)
+
+
+def _gap_fills(kept: list[Candidate], budget: int) -> list[Candidate]:
+    """Synthesize `"fill"` candidates for the sparse kept sets only.
+
+    A fill exists when the kept set is below `budget` and a gap between two
+    consecutive kept timestamps is at least twice the sampler's `interval`
+    wide — otherwise the timeline is already dense enough that a midpoint
+    frame would land right next to a kept one. One fill rises per gap, at
+    the gap's midpoint; the widest gaps fill first, each midpoint rounded
+    to six decimals for reproducibility. An empty kept set gets nothing to
+    fill, and fills never displace a real candidate since they only exist
+    within the room `budget` refuses to `kept`.
+    """
+    room = budget - len(kept)
+    if room <= 0 or not kept:
+        return []
+    minimum_gap = 2 * float(interval)
+    times = sorted(candidate.timestamp for candidate in kept)
+    gaps = ((times[index + 1] - times[index], index) for index in range(len(times) - 1))
+    widest_first = sorted((gap for gap in gaps if gap[0] >= minimum_gap), reverse=True)
+    return [
+        Candidate(
+            timestamp=round(times[index] + span / 2.0, 6),
+            reason="fill",
+            score=0.0,
+        )
+        for span, index in widest_first[:room]
+    ]
+
+
+def _audio_event_timestamp(event: object) -> float | None:
+    """Read one audio event's timestamp, or None when it carries no readable one.
+
+    A plain number is a timestamp itself; otherwise an object's `timestamp`
+    attribute or a mapping's `"timestamp"` key is read. Anything else
+    returns None and contributes nothing later — an unparsable event never
+    crashes the ranker and never invents a candidate for the caller.
+    """
+    if isinstance(event, bool):
+        return None
+    if isinstance(event, (int, float)):
+        return float(event)
+    if isinstance(event, Mapping):
+        value = event.get("timestamp")
+    else:
+        value = getattr(event, "timestamp", None)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _plain_decimal(value: float) -> str:
+    """Format a number as plain decimal text for a filter argument.
+
+    Always digits, never scientific notation, so `scdet=threshold=<this>`
+    reads one number everywhere a locale could disagree with an exponent:
+    10.0 renders as `10`, 0.05 as `0.05`, and a huge value stays a digit
+    string instead of growing an `e`.
+    """
+    text = f"{value:.10f}".rstrip("0")
+    return text.removesuffix(".")
 
 
 def _is_relative_to(child: Path, root: Path) -> bool:
