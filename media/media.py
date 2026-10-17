@@ -11,7 +11,15 @@ text, so a changed banner can never break the parse. The same module decides
 which frames are worth rasterizing at all: `detect_scenes` scores hard cuts,
 `sample_candidates` merges them with interval ticks and collapses near
 duplicates by perceptual hash, and `rank_candidates` spends the caller's
-frame budget with a complete reason accounting.
+frame budget with a complete reason accounting. The frame half then
+rasterizes what was chosen: `resolve_crop` turns an explicit box, `"auto"`,
+or nothing into crop geometry, `extract_frame` pulls one still through
+`crop` and the bounded scale, `render_sheet` and `render_filmstrip`
+composite labelled tiles into one PNG, and `resolve_font` finds a font
+without ever failing a call because one is missing. Only this module reads
+the environment, and for labels that is exactly one variable,
+`MEDIA_FONT_FILE`.
+
 
 Heavy commands (scene scans, frame extraction, OCR, transcription) run through
 `run_child`: the child leads its own process group so a timeout or a cancel
@@ -24,10 +32,13 @@ from __future__ import annotations
 import codecs
 import hashlib
 import json
+import math
 import os
 import re
 import signal
+import struct
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -91,6 +102,23 @@ _SCD_LINE = re.compile(
 # weight, so `scene` beats `audio` beats `interval` beats `fill`.
 _REASON_PRIORITY = {"scene": 0, "audio": 1, "interval": 2, "fill": 3}
 _RANKING_REASONS = ("scene", "audio", "interval", "fill")
+
+# Frames: the JPEG fallback of the design (encode PNG, and only when the PNG
+# exceeds this size re-encode to mjpeg and report both limits), the auto-crop
+# sampler geometry measured on this host (a grid of side-by-side 64-wide
+# tiles, 2..32 of them, a difference step of 16 gray levels, and a
+# 90-percent "the frame changes everywhere or the grid padded black" bail-out),
+# and the burned-label typography measured OCR-legible at 320 pixels wide with
+# a 40-pixel font, which every tile scales from.
+JPEG_FALLBACK_BYTES = 2 * 1024 * 1024
+_AUTOCROP_TILE_WIDTH = 64
+_AUTOCROP_MIN_TILES = 2
+_AUTOCROP_MAX_TILES = 32
+_AUTOCROP_DIFF_STEP = 16
+_AUTOCROP_BUSY_TILES = 0.9
+_LABEL_FONT_REFERENCE_WIDTH = 320
+_LABEL_FONT_REFERENCE_SIZE = 40
+_LABEL_FONT_SIZE_MIN = 12
 
 
 class MediaError(RuntimeError):
@@ -952,3 +980,750 @@ def _ratio(value: object) -> float:
     if divisor == 0.0:
         return 0.0
     return _as_float(numerator) / divisor
+
+
+# Frames: extraction, crop, tiling, and labels ---------------------------------
+
+
+@dataclass(frozen=True)
+class Box:
+    """An integer rectangle in frame pixels: top-left corner and extent.
+
+    `resolve_crop` produces these in frame coordinates (never negative,
+    never past the measured frame edge) and the auto-crop mask maths
+    produces tile-space boxes of the same shape for the caller to scale.
+    """
+
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
+class FrameRef:
+    """One extracted frame with where it stands on the timeline.
+
+    `timestamp` is the media-time second the frame represents, `path` is
+    where the frame image persists (the caller's decision, never written
+    by extraction itself, which works in bytes only), and the dimensions
+    are the frame's own measured extents after crop and scale.
+    """
+
+    timestamp: float
+    path: Path
+    width: int
+    height: int
+
+
+def sniff_image_format(data: bytes) -> str:
+    """Return `"png"` or `"jpeg"` for the image format of `data`.
+
+    Magic bytes decide: the 8-byte PNG signature or the `ff d8 ff` JPEG
+    start marker. The JPEG fallback path (see `JPEG_FALLBACK_BYTES`) must
+    be observably reported, so an unidentifiable payload is a `MediaError`
+    here rather than a silent guess that a consumer would trust.
+    """
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    raise MediaError(
+        f"unrecognized image format: a payload of {len(data)} bytes carries "
+        "neither a PNG signature nor JPEG magic"
+    )
+
+
+def resolve_crop(
+    spec: str | dict | None,
+    probe: ProbeResult,
+    path: Path,
+    start: float,
+    end: float,
+    fps: float,
+    pad: int = 8,
+) -> Box | None:
+    """Resolve a crop request into a `Box` in frame pixels, or None for none.
+
+    `None` means the whole frame stays. An explicit mapping must carry every
+    one of the `x`, `y`, `width`, `height` keys — a missing key is a
+    `MediaError` naming it — and the box must fit inside the frame probe
+    measured, with that measured size in the rejection message. The string
+    `"auto"` runs one ffmpeg pass over the clamped window (clamping past-the-
+    end windows is what keeps the tile grid exactly filled, because `tile`
+    pads an under-filled grid with black and the difference mask would then
+    see motion that is only padding): it downscales the window to
+    `_AUTOCROP_TILE_WIDTH`-wide gray tiles, marks the cells whose values move
+    more than `_AUTOCROP_DIFF_STEP` across the tiles, and scales the marked
+    bounding box back to frame pixels padded by `pad` and clamped. A
+    motionless window, and one where 90 percent or more of all cells move
+    (frame-filling motion or black padding), resolves to None so the design's
+    full-frame fallback applies. Anything other string is a `MediaError`.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, Mapping):
+        return _explicit_box(spec, probe)
+    if spec == "auto":
+        return _auto_box(probe, Path(path), start, end, fps, pad)
+    raise MediaError(
+        f"crop spec must be None, 'auto', or a mapping with x/y/width/height "
+        f"keys, not {spec!r}"
+    )
+
+
+def extract_frame(
+    path: Path, timestamp: float, crop: Box | None, max_edge: int
+) -> bytes:
+    """Extract one still of `path` at `timestamp` seconds as PNG bytes.
+
+    Probing comes first, so a source without video fails with `no video
+    stream` in the message instead of letting an ffmpeg error be the only
+    signal. When `crop` is given, a `crop` filter runs before the bounded
+    scale (`-vf crop=...,scale='if(gt(iw,ih),min(iw,MAX),-2)':'if(gt(iw,ih),
+    -2,min(ih,MAX))'`); the still comes back over an image pipe as PNG. An
+    empty or non-zero-exit run is a `MediaError` naming the path, the
+    timestamp, and ffmpeg's captured stderr; and when the encoded PNG
+    exceeds `JPEG_FALLBACK_BYTES` the frame is re-encoded to mjpeg — the
+    fallback both limits are reported against, and the caller can tell it
+    happened through `sniff_image_format`.
+    """
+    path = Path(path)
+    result = probe(path)
+    if not result.has_video:
+        raise MediaError(f"{path} has no video stream, so no frame can be extracted")
+    if max_edge < 1:
+        raise MediaError(
+            f"extract_frame needs a max_edge of at least 1, not {max_edge}"
+        )
+    argv = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-ss",
+        _plain_decimal(float(timestamp)),
+        "-i",
+        str(path),
+        "-vf",
+        ",".join(_frame_filters(crop, max_edge)),
+        "-frames:v",
+        "1",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "png",
+        "-",
+    ]
+    done = run_child(argv, stdin_bytes=b"")
+    frame = done.stdout.encode("latin-1")
+    if done.returncode != 0 or not frame:
+        raise MediaError(
+            f"frame extraction from {path} at {timestamp}s failed: ffmpeg "
+            f"exited {done.returncode}; captured stderr: "
+            f"{done.stderr.strip() or '(none)'}"
+        )
+    if len(frame) > JPEG_FALLBACK_BYTES:
+        return _reencode_as_mjpeg(frame, f"the frame from {path} at {timestamp}s")
+    return frame
+
+
+def render_sheet(pngs: list[tuple[float, bytes]], labels: bool, max_edge: int) -> bytes:
+    """Composite frames into one labelled contact sheet, PNG bytes.
+
+    Frames arrive as `(timestamp, image_bytes)` already rasterized; the
+    sheet scales each to a `max_edge // cols`-wide tile (`cols` grows with
+    the square root of the frame count), stacks them with one `xstack`
+    filter, and burns `HH:MM:SS.mmm` per tile in the top-left corner when
+    `labels` is true and a font is resolvable. A missing font yields
+    unlabelled tiles and no error — a label is decoration, never a
+    precondition. The sheet's width stays under `max_edge` by construction.
+    """
+    return _render_composite(pngs, labels, max_edge, "sheet")
+
+
+def render_filmstrip(
+    pngs: list[tuple[float, bytes]], labels: bool, max_edge: int
+) -> bytes:
+    """Composite frames into one vertical filmstrip, PNG bytes.
+
+    One `vstack` filter stacks the frames, so every input is scaled to the
+    smallest width among them capped at `max_edge` (even, because vstack
+    demands equal widths); each frame keeps whatever crop it already
+    carried when it was extracted, and its aspect survives the scale.
+    Labels follow the same rule as the sheet.
+    """
+    return _render_composite(pngs, labels, max_edge, "filmstrip")
+
+
+def resolve_font() -> Path | None:
+    """Find a font file for burned-in labels, or None when nothing qualifies.
+
+    `MEDIA_FONT_FILE` wins when it is set — the set-but-missing case returns
+    None on purpose, honouring the owner's miss rather than second-guessing
+    it. Otherwise `fc-match monospace` decides, and its file returns only if
+    it exists. A missing fontconfig binary, a failed match, or a reported
+    path that does not exist are all None with no exception: the design
+    forbids losing a frame set to a font. This is the one environment read
+    in this module, and it reads only `MEDIA_FONT_FILE`.
+    """
+    env_value = os.environ.get("MEDIA_FONT_FILE")
+    if env_value:
+        path = Path(env_value)
+        return path if path.exists() else None
+    try:
+        done = run_child(
+            ["fc-match", "monospace", "--format", "%{file}\t%{family}\n"],
+            timeout_seconds=30,
+        )
+    except MediaError:
+        return None
+    if done.returncode != 0:
+        return None
+    first = next((line for line in done.stdout.splitlines() if line.strip()), "")
+    reported = first.split("\t")[0].strip()
+    if not reported:
+        return None
+    path = Path(reported)
+    return path if path.is_file() else None
+
+
+def _frame_filters(crop: Box | None, max_edge: int) -> list[str]:
+    """The per-frame still filters: crop when a box is given, then the scale.
+
+    The scale expression keeps the long edge at or under `max_edge` and the
+    short edge at an even width or height (`-2`), so consumers that expect
+    even chroma dimensions stay happy without a second pass.
+    """
+    filters = []
+    if crop is not None:
+        filters.append(f"crop=w={crop.width}:h={crop.height}:x={crop.x}:y={crop.y}")
+    filters.append(
+        f"scale='if(gt(iw,ih),min(iw,{int(max_edge)}),-2)':"
+        f"'if(gt(iw,ih),-2,min(ih,{int(max_edge)}))'"
+    )
+    return filters
+
+
+def _explicit_box(spec: Mapping, probe: ProbeResult) -> Box:
+    """Validate an explicit crop mapping against the probe's measured frame.
+
+    Every key is required and named when missing; values must be plain
+    numbers (integer-valued is enough, so `128.0` is accepted); and the
+    resulting rectangle must lie inside the frame, with the measured frame
+    size quoted in the rejection so the caller can correct the spec against
+    the file that actually exists.
+    """
+    values: dict[str, int] = {}
+    for key in ("x", "y", "width", "height"):
+        if key not in spec:
+            raise MediaError(
+                f"crop dict is missing the required key '{key}' (crop needs "
+                f"all of x, y, width, height)"
+            )
+        value = spec[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise MediaError(f"crop key '{key}' must be a number, not {value!r}")
+        values[key] = int(value)
+    box = Box(values["x"], values["y"], values["width"], values["height"])
+    if (
+        box.x < 0
+        or box.y < 0
+        or box.width <= 0
+        or box.height <= 0
+        or box.x + box.width > probe.width
+        or box.y + box.height > probe.height
+    ):
+        raise MediaError(
+            f"crop box (x={box.x}, y={box.y}, width={box.width}, "
+            f"height={box.height}) does not fit inside the measured frame "
+            f"{probe.width}x{probe.height} of the source"
+        )
+    return box
+
+
+def _auto_box(
+    probe: ProbeResult,
+    path: Path,
+    start: float,
+    end: float,
+    fps: float,
+    pad: int,
+) -> Box | None:
+    """Measure one tiled pass over the window and scale its motion box back.
+
+    The raw read must be exactly `tiles * tw * th` gray bytes — a shorter or
+    longer payload is a truncated (or corrupted) pipeline read and a
+    `MediaError`, naming the path and both byte counts. Grid geometry comes
+    from the probe's own measured width and height so the scale back is
+    faithful.
+    """
+    if not probe.has_video or probe.width <= 0 or probe.height <= 0:
+        raise MediaError(f"auto crop has no measured frame to work from for {path}")
+    start = max(0.0, float(start))
+    end = min(float(end), probe.duration)
+    span = end - start
+    if span <= 0.0:
+        return None
+    tiles = max(_AUTOCROP_MIN_TILES, min(round(span * float(fps)), _AUTOCROP_MAX_TILES))
+    tw = _AUTOCROP_TILE_WIDTH
+    th = max(2, (tw * probe.height // probe.width) & ~1)
+    argv = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-ss",
+        _plain_decimal(start),
+        "-t",
+        _plain_decimal(span),
+        "-i",
+        str(path),
+        "-vf",
+        (
+            f"fps={_plain_decimal(float(fps))},trim=end_frame={tiles},"
+            f"scale={tw}:{th},tile={tiles}x1"
+        ),
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "gray",
+        "-f",
+        "rawvideo",
+        "-",
+    ]
+    done = run_child(argv, stdin_bytes=b"")
+    raster = done.stdout.encode("latin-1")
+    expected = tiles * tw * th
+    if done.returncode != 0 or len(raster) != expected:
+        raise MediaError(
+            f"auto crop over window [{start}, {end}] of {path} measured "
+            f"{len(raster)} raw gray bytes where {expected} were required "
+            f"for a {tiles}-tile {tw}x{th} grid (exit code {done.returncode})"
+        )
+    tile_box = _motion_box(raster, tw, th, tiles)
+    if tile_box is None:
+        return None
+    return _scale_tile_box_back(tile_box, probe.width, probe.height, tw, th, pad)
+
+
+def _motion_box(
+    raster: bytes, tile_width: int, tile_height: int, tiles: int
+) -> Box | None:
+    """Locate the moving cells of a tiled gray raster and shrink them to a box.
+
+    Pure maths on the bytes, unit-testable without ffmpeg: the grid is
+    `tiles` `tile_width`x`tile_height` tiles side by side exactly as ffmpeg's
+    `tile=<n>x1` emits them, so cell `(dy, dx)` of tile `t` is
+    `raster[dy * stride + t * tile_width + dx]`. A cell is marked when its
+    value span across the tiles exceeds `_AUTOCROP_DIFF_STEP`; the marked
+    cells' bounding box comes back in tile coordinates. No marked cell means
+    nothing moved (None), and 90 percent or more of all cells marked means
+    the result is either frame-filling motion or a black-padded grid — both
+    poison for a crop, both resolving to None.
+    """
+    stride = tile_width * tiles
+    marked: list[tuple[int, int]] = []
+    for dy in range(tile_height):
+        row_base = dy * stride
+        for dx in range(tile_width):
+            values = [raster[row_base + t * tile_width + dx] for t in range(tiles)]
+            if max(values) - min(values) > _AUTOCROP_DIFF_STEP:
+                marked.append((dy, dx))
+    if not marked:
+        return None
+    if len(marked) >= _AUTOCROP_BUSY_TILES * (tile_height * tile_width):
+        # All or nearly all cells moving is the black-padding poison detector
+        # just as much as an honest frame-filling motion: no crop result.
+        return None
+    xs = [dx for _, dx in marked]
+    ys = [dy for dy, _ in marked]
+    return Box(
+        x=min(xs),
+        y=min(ys),
+        width=max(xs) - min(xs) + 1,
+        height=max(ys) - min(ys) + 1,
+    )
+
+
+def _scale_tile_box_back(
+    tile_box: Box, width: int, height: int, tw: int, th: int, pad: int
+) -> Box:
+    """Scale a tile-space box back to frame pixels, pad it, and clamp it.
+
+    `sx` and `sy` come from the probe's measured frame over the measured
+    grid, the box grows by `pad` on every side, and the clamps keep the
+    result a legal rectangle: non-negative corner, positive extent, and
+    inside the frame.
+    """
+    sx = width / tw
+    sy = height / th
+    x0 = int(tile_box.x * sx)
+    y0 = int(tile_box.y * sy)
+    x1 = math.ceil((tile_box.x + tile_box.width) * sx)
+    y1 = math.ceil((tile_box.y + tile_box.height) * sy)
+    x0 = max(0, x0 - pad)
+    y0 = max(0, y0 - pad)
+    x1 = min(width, x1 + pad)
+    y1 = min(height, y1 + pad)
+    return Box(x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+
+def _render_composite(
+    pngs: list[tuple[float, bytes]], labels: bool, max_edge: int, mode: str
+) -> bytes:
+    """Stack frames into one image through a single ffmpeg filter graph.
+
+    The per-tile work happens first (label burn through one `ass` filter per
+    distinct text, one ASS document per tile written to a scratch directory
+    the OS cleans up), the labelled tiles land as files so one compositing
+    ffmpeg can read them as inputs, and the stacking itself is one graph —
+    `xstack` for the sheet, `vstack` for the filmstrip. A missing font turns
+    labels off silently; every real failure raises.
+    """
+    if not pngs:
+        raise MediaError(f"{mode} render received no frames to composite")
+    if max_edge < 1:
+        raise MediaError(
+            f"{mode} render needs a max_edge of at least 1, not {max_edge}"
+        )
+    frames = [frame for _, frame in pngs]
+    dimensions = [_image_dimensions(frame) for frame in frames]
+    with tempfile.TemporaryDirectory(prefix="media-tiles-") as scratch:
+        root = Path(scratch)
+        tiles = [root / f"{index:04d}.png" for index in range(len(frames))]
+        for tile_path, frame in zip(tiles, frames):
+            tile_path.write_bytes(frame)
+        if labels:
+            font = resolve_font()
+            if font is not None:
+                family = _font_family(font) or "monospace"
+                for index, (timestamp, frame) in enumerate(pngs):
+                    tiles[index].write_bytes(
+                        _label_tile(frame, timestamp, dimensions[index], family, font)
+                    )
+        graph = _composite_graph(mode, max_edge, dimensions)
+        argv = ["ffmpeg", "-hide_banner", "-nostdin"]
+        for tile_path in tiles:
+            argv += ["-i", str(tile_path)]
+        argv += [
+            "-filter_complex",
+            graph,
+            "-map",
+            "[out]",
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "-",
+        ]
+        done = run_child(argv, stdin_bytes=b"")
+        composite = done.stdout.encode("latin-1")
+        if done.returncode != 0 or not composite:
+            raise MediaError(
+                f"{mode} compositing of {len(pngs)} frames failed: ffmpeg "
+                f"exited {done.returncode}; captured stderr: "
+                f"{done.stderr.strip() or '(none)'}"
+            )
+    if len(composite) > JPEG_FALLBACK_BYTES:
+        return _reencode_as_mjpeg(
+            composite, f"the {mode} composite of {len(pngs)} frames"
+        )
+    return composite
+
+
+def _composite_graph(mode: str, max_edge: int, dimensions: list) -> str:
+    """Build the one ffmpeg filter graph that stacks the scaled tiles.
+
+    Sheet mode scales each input to `max_edge // cols` wide (aspect kept,
+    heights recomputed per tile from its own measured box) and lays out a
+    regular grid left-to-right, top-to-bottom, one row offset per grid row
+    so overlapping tiles are impossible. Filmstrip mode scales every input
+    to one shared even width — the smallest measured width capped by
+    `max_edge` — because vstack demands equal widths. A single frame needs
+    no stack at all.
+    """
+    count = len(dimensions)
+    chains: list[str] = []
+    if mode == "sheet":
+        cols = max(1, math.ceil(math.sqrt(count)))
+        tile_w = max(1, max_edge // cols)
+        if count == 1:
+            chains.append(f"[0:v]scale={tile_w}:-2[out]")
+            return ";".join(chains)
+        heights = [_even_up(tile_w * section[1] / section[0]) for section in dimensions]
+        row_y = 0
+        layout_parts: list[str] = []
+        for index in range(count):
+            if index % cols == 0:
+                row_y = sum(
+                    max(
+                        heights[row * cols + col]
+                        for col in range(cols)
+                        if row * cols + col < count
+                    )
+                    for row in range(index // cols)
+                )
+            layout_parts.append(f"{(index % cols) * tile_w}_{row_y}")
+        chains += [f"[{index}:v]scale={tile_w}:-2[s{index}]" for index in range(count)]
+        chains.append(
+            "".join(f"[s{index}]" for index in range(count))
+            + f"xstack=inputs={count}:layout={_stack_layout(layout_parts)}[out]"
+        )
+        return ";".join(chains)
+    # Filmstrip: one shared even width, capped by max_edge.
+    narrowest = min(width for width, _ in dimensions)
+    strip_w = max(2, min(narrowest, max_edge) & ~1)
+    if count == 1:
+        chains.append(f"[0:v]scale={strip_w}:-2[out]")
+        return ";".join(chains)
+    chains += [f"[{index}:v]scale={strip_w}:-2[s{index}]" for index in range(count)]
+    chains.append(
+        "".join(f"[s{index}]" for index in range(count)) + f"vstack=inputs={count}[out]"
+    )
+    return ";".join(chains)
+
+
+def _stack_layout(parts: list[str]) -> str:
+    """Join `x_y` position strings the way xstack's layout wants."""
+    return "|".join(parts)
+
+
+def _even_up(value: float) -> int:
+    """Round up to an even integer, for heights recomputed per tile."""
+    return math.ceil(value / 2.0) * 2
+
+
+def _label_tile(
+    frame: bytes,
+    timestamp: float,
+    dimensions: tuple[int, int],
+    family: str,
+    font: Path,
+) -> bytes:
+    """Burn `HH:MM:SS.mmm` into one frame's top-left corner through `ass`.
+
+    One ASS document per tile because the text differs per tile; `fontsdir`
+    points at the font's own directory so a resolved family always loads.
+    The glyph size scales with the tile (see
+    `_LABEL_FONT_REFERENCE_*`), so a big sheet and a small filmstrip carry
+    equally legible labels in that same measured proportion. Fontconfig
+    noise on stderr is not failure: only the exit code and an empty payload
+    decide.
+    """
+    width, height = dimensions
+    size = max(
+        _LABEL_FONT_SIZE_MIN,
+        round(width * _LABEL_FONT_REFERENCE_SIZE / _LABEL_FONT_REFERENCE_WIDTH),
+    )
+    with tempfile.TemporaryDirectory(prefix="media-ass-") as scratch:
+        document = Path(scratch) / "label.ass"
+        document.write_text(
+            _label_ass_document(
+                width,
+                height,
+                _timestamp_label(timestamp),
+                family,
+                size,
+            ),
+            encoding="utf-8",
+        )
+        argv = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg" if sniff_image_format(frame) == "jpeg" else "png",
+            "-i",
+            "-",
+            "-frames:v",
+            "1",
+            "-vf",
+            (f"ass={_filter_quote(document)}:fontsdir={_filter_quote(font.parent)}"),
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "-",
+        ]
+        done = run_child(argv, stdin_bytes=frame)
+        labelled = done.stdout.encode("latin-1")
+        if done.returncode != 0 or not labelled:
+            raise MediaError(
+                f"label burn for the tile at {timestamp}s failed: ffmpeg "
+                f"exited {done.returncode}; captured stderr: "
+                f"{done.stderr.strip() or '(none)'}"
+            )
+        return labelled
+
+
+def _label_ass_document(
+    width: int, height: int, text: str, family: str, size: int
+) -> str:
+    """Generate the ASS document carrying one top-left timestamp event.
+
+    `PlayResX`/`PlayResY` match the tile so coordinates stay honest, white
+    text over a black outline stays readable on any background, and
+    alignment 7 anchors the text at the top-left margin the design wants.
+    """
+    return (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {width}\n"
+        f"PlayResY: {height}\n"
+        "ScaledBorderAndShadow: yes\n"
+        "WrapStyle: 2\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour"
+        ", OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX"
+        ", ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment"
+        ", MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Label,"
+        f"{family},{size}"
+        ",&H00FFFFFF,&H00000000,&H00000000,&H00000000"
+        ",0,0,0,0,100,100,0,0,1,2,0,7,10,10,10,1\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV"
+        ", Effect, Text\n"
+        f"Dialogue: 0,0:00:00.00,9:59:59.99,Label,,0,0,0,,{text}\n"
+    )
+
+
+def _timestamp_label(seconds: float) -> str:
+    """Format a media timestamp as `HH:MM:SS.mmm`, the design's label shape."""
+    total_ms = max(0, round(float(seconds) * 1000))
+    hours, rest = divmod(total_ms, 3_600_000)
+    minutes, rest = divmod(rest, 60_000)
+    secs, millis = divmod(rest, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def _font_family(font: Path) -> str | None:
+    """Read a font file's family with fc-scan; None when that lookup fails.
+
+    The family goes into the ASS style line; libass needs the real name, and
+    a failed lookup means the caller falls back to the literal `monospace`
+    family with `fontsdir` still set.
+    """
+    try:
+        done = run_child(
+            ["fc-scan", "--format", "%{family}\n", str(font)],
+            timeout_seconds=30,
+        )
+    except MediaError:
+        return None
+    if done.returncode != 0:
+        return None
+    first = next((line for line in done.stdout.splitlines() if line.strip()), "")
+    family = first.strip()
+    return family or None
+
+
+def _reencode_as_mjpeg(payload: bytes, what: str) -> bytes:
+    """Re-encode an oversized PNG to mjpeg and return those bytes.
+
+    ffmpeg's mjpeg encoder exposes qscale, not a quality percentage, so
+    `-q:v 3` is the closest documented stand-in for the design's quality 85;
+    this is the fallback the design demands be reported (via
+    `sniff_image_format`), never a silent format switch.
+    """
+    argv = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-f",
+        "image2pipe",
+        "-c:v",
+        "png",
+        "-i",
+        "-",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "3",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
+        "-",
+    ]
+    done = run_child(argv, stdin_bytes=payload)
+    jpeg = done.stdout.encode("latin-1")
+    if done.returncode != 0 or not jpeg:
+        raise MediaError(
+            f"jpeg fallback re-encode of {what} failed: ffmpeg exited "
+            f"{done.returncode}; captured stderr: "
+            f"{done.stderr.strip() or '(none)'}"
+        )
+    return jpeg
+
+
+def _image_dimensions(data: bytes) -> tuple[int, int]:
+    """Measure an already-encoded image stream, standard library only.
+
+    PNG goes through its IHDR; JPEG through its start-of-frame marker. The
+    renderers need each tile's box to lay out the stack and to scale the
+    label font, and a producer may have delivered the mjpeg fallback form,
+    so both formats are read here. Anything else is a `MediaError`, the same
+    rule `sniff_image_format` applies.
+    """
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        if data[12:16] != b"IHDR":
+            raise MediaError(f"PNG stream of {len(data)} bytes carries no IHDR chunk")
+        width, height = struct.unpack(">II", data[16:24])
+        return width, height
+    if data[:3] == b"\xff\xd8\xff":
+        return _jpeg_dimensions(data)
+    raise MediaError(
+        f"cannot measure image dimensions: a payload of {len(data)} bytes is "
+        "neither PNG nor JPEG"
+    )
+
+
+def _jpeg_dimensions(data: bytes) -> tuple[int, int]:
+    """Walk JPEG marker segments for the first start-of-frame marker.
+
+    Only the markers a real encoder emits need walking: standalone markers
+    carry no length, everything else does, and any format-signed width and
+    height after the marker are big-endian. No start-of-frame marker at all
+    is a malformed stream and a `MediaError`.
+    """
+    index = 2
+    limit = len(data)
+    while index + 1 < limit:
+        if data[index] != 0xFF:
+            raise MediaError(
+                f"malformed JPEG stream of {len(data)} bytes: expected a "
+                f"marker at byte {index}"
+            )
+        while index < limit and data[index] == 0xFF:
+            index += 1
+        if index >= limit:
+            break
+        marker = data[index]
+        if marker in (0x01, 0xD8) or 0xD0 <= marker <= 0xD7:
+            # Standalone markers carry no length segment.
+            index += 1
+            continue
+        if index + 3 > limit:
+            break
+        seg_len = (data[index + 1] << 8) | data[index + 2]
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            if index + 8 > limit:
+                break
+            height, width = struct.unpack(">HH", data[index + 4 : index + 8])
+            return width, height
+        index += 1 + seg_len
+    raise MediaError(
+        f"malformed JPEG stream of {len(data)} bytes: no start-of-frame marker"
+    )
+
+
+def _filter_quote(value: Path) -> str:
+    """Quote a filesystem path for use inside an ffmpeg filter argument."""
+    escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"

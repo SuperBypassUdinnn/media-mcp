@@ -27,6 +27,10 @@ AUDIO_RATE = 48000
 BASE_VOLUME = 0.1
 SPIKE_VOLUME = 5.0
 SPIKE_SECONDS = 1.0
+# The motion-patch clip: a static dark background with one opaque light patch
+# whose exact on-screen rectangle and switch-on time the tests assert against.
+MOTION_PATCH = (700, 420, 300, 180)
+MOTION_PATCH_APPEARS_AT = 4.2
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
@@ -134,6 +138,60 @@ def make_audio_only(path: Path) -> Path:
             "aac",
             "-b:a",
             "128k",
+            str(path),
+        ]
+    )
+    return path
+
+
+def make_motion_patch(
+    path: Path,
+    *,
+    duration: int = 6,
+    size: tuple[int, int] = (1280, 720),
+    rate: int = 25,
+    patch: tuple[int, int, int, int] = MOTION_PATCH,
+    appears_at: float = MOTION_PATCH_APPEARS_AT,
+) -> Path:
+    """Write a static dark clip with one light patch that turns on and stays on.
+
+    `testsrc` motion fills the entire frame, so auto crop over it can never
+    shrink tighter than the frame edges and the crop tests would be unfalsifiable.
+    This builder instead leaves the background motionless and restricts all real
+    motion to one opaque `drawbox` rectangle that is off before `appears_at` and
+    on afterwards, so the auto-crop pass over a window that straddles
+    `appears_at` (4.0 to 5.0 at fps=10) measures exactly the `patch` rectangle.
+    The clip carries no audio; frame tests do not need a stream.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    width, height = size
+    px, py, pw, ph = patch
+    _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            (f"color=c=0x202020:size={width}x{height}:rate={rate}:duration={duration}"),
+            "-vf",
+            (
+                f"drawbox=x={px}:y={py}:w={pw}:h={ph}"
+                f":color=white@1:t=fill:enable={_filter_quote(f'between(t,{appears_at},{duration + 1})')}"
+            ),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
             str(path),
         ]
     )
