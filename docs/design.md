@@ -293,10 +293,12 @@ Four stages, in order. Stages 1 and 2 produce a candidate list in
 for a specific timestamp.
 
 1. **Scene boundaries.** One decode pass using the `scdet` filter, which
-   emits a per-frame scene-change score, at a threshold that varies by profile
-   (default `0.30`; `0.20` for screencast-like content where screens change
-   subtly). The per-frame scores are kept because stage 3 ranks with them.
-   `scdet` is present in the ffmpeg build on this machine, so no scene
+   reports one scene-change score per second in its own units. Measured on this
+   machine: continuous motion in `testsrc` scores about `0.5`, while a hard cut
+   scores about `35`. The threshold therefore varies by profile in those units
+   (default `10.0`, the filter's own default; `5.0` for screencast-like content
+   where screens change subtly). The scores are kept because stage 3 ranks with
+   them. `scdet` is present in the ffmpeg build on this machine, so no scene
    detection library is added.
 2. **Fixed-interval candidates.** Sampling every `interval` seconds
    (default `3`) added to the candidate set, then reduced by perceptual hash:
@@ -335,9 +337,12 @@ described in section 5.0.
   sub-second glitches, where neighbouring frames disagree visibly.- `individual` writes one PNG per frame, for when the caller wants to point
   `read` at a specific moment.
 
-Labels are drawn with the `drawtext` filter. A monospace font is resolved from
-the system through `fc-match`, and when no font is usable the tool reports
-that and still returns the image without labels.
+Labels are drawn by generating an ASS file and burning it in with the `ass`
+filter. `drawtext` is absent from the ffmpeg build on this machine while `ass`
+and `subtitles` (libass) are present, and one backend then serves both tile
+labels and the burned-in text of the test fixtures. A monospace font is
+resolved from the system through `fc-match` and named in the ASS style; when no
+font is usable the tool reports that and still returns the image without labels.
 
 When `crop="auto"` is requested, the box is computed once per window from the
 frame-to-frame difference union, then reused by both `media_frames` and
@@ -430,6 +435,7 @@ configurations can stay minimal.
 | `MEDIA_CACHE_DIR` | `~/.cache/media-mcp` | Cache root |
 | `MEDIA_CACHE_CAP` | `20 GiB` | LRU size cap enforced after each job |
 | `MEDIA_TRANSCRIBE_BIN` | `<repo>/transcribe/transcribe.sh` | Delegated pipeline entry point |
+| `MEDIA_TRANSCRIBE_ENV` | `~/.config/opencode/skills/transcribe-diarize/.env` | Token file the delegated pipeline reads; it stays outside the repository |
 | `MEDIA_DEVICE` | `auto` | Default compute device: `auto`, `cuda`, `cpu` |
 | `MEDIA_VRAM_FLOOR` | `2800 MiB` | Free VRAM below which the model tier drops |
 | `MEDIA_FRAME_MAX_EDGE` | `1600` | Longest frame edge in pixels |

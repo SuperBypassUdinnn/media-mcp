@@ -40,8 +40,8 @@ Sections referenced below as "spec section N".
 - Frames: `max_edge` default `1600` px, PNG, JPEG q85 fallback only above
   `2 MiB`.
 - Frame sampling constants, internal and not tool parameters: interval `3` s,
-  `dedup_distance` `6`, scene threshold default `0.30` (`0.20` for
-  screencast-like content).
+  `dedup_distance` `6`, scene threshold default `10.0` in `scdet` score units
+  (`5.0` for screencast-like content).
 - Per-call ceilings: `count` 60, `fps` 30, `k` 20, `timeout_seconds` 900
   default and 21600 ceiling.
 - Every tool response ends with a status block naming what was computed, what
@@ -111,7 +111,9 @@ prints a version `>= 1.29`.
 
 - [ ] **Step 2: Write `.gitignore`, `pyproject.toml`, `README.md`**
 
-`.gitignore` ignores `.venv/`, `__pycache__/`, `.ruff_cache/`, `*.pyc`.
+`.gitignore` ignores `.venv/`, `__pycache__/`, `.ruff_cache/`, `*.pyc`, and
+`.env` (the delegated pipeline keeps its token file outside the repository, and
+the ignore line makes a stray copy harmless).
 `pyproject.toml` sets `[tool.ruff] line-length = 88` and
 `[tool.pytest.ini_options] testpaths = ["tests"]`. `README.md` states the
 one-line purpose and nothing else yet; Task 15 writes `docs/client-config.md`
@@ -144,12 +146,21 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'tests.fixtures'`.
 
 - [ ] **Step 5: Implement `fixtures.py`**
 
-Use `ffmpeg` with `-f lavfi -i testsrc` for video and
-`-f lavfi -i sine` for audio, `drawtext` for the burned-in text and
-counter, and `volume` automation or a second short audio input mixed in
-with `adelay` for the spike. Use argument lists, never a shell string. For
-`audio_offset`, pass `-itsoffset` on the audio input. Add
-`tests/__init__.py` so `from tests import fixtures` resolves.
+Use `ffmpeg` with `-f lavfi -i testsrc` for the video pattern and
+`-f lavfi -i sine` for audio. Burn text with the `ass` filter and a generated
+ASS file: `drawtext` is absent from the ffmpeg build on this machine while
+`ass`/`subtitles` (libass) are present, so one mechanism covers the fixture
+text, the counter, and the tile labels of Task 8. Overlay the counter as one ASS
+event per second, one value before `counter_jump_at` and another after, and put
+the hard cut at `counter_jump_at` by concatenating two segments of different
+backgrounds so `scdet` has a real cut to find. For `text`, prefer a light solid
+background segment: OCR misread the burned-in text when it sat on `testsrc`
+("LANJUT 80" came back as "IFANYUT 80"), so the fixture that Task 9 OCRs must
+not be the busy pattern. Use `volume` automation or a second short audio input
+mixed in with `adelay` for the spike, and `-itsoffset` on the audio input for
+`audio_offset`. Use argument lists, never a shell string. Also provide
+`png_size(png_bytes: bytes) -> tuple[int, int]`, which the Task 8 tests call.
+Add `tests/__init__.py` so `from tests import fixtures` resolves.
 
 - [ ] **Step 6: Run the test again**
 
@@ -545,12 +556,16 @@ git add -A && git commit -m "feat(media): bounded cancellable subprocess runner"
     `score: float`.
   - `@dataclass(frozen=True) class Candidate` with `timestamp: float`,
     `reason: str` in `{"scene", "audio", "interval", "fill"}`, `score: float`.
-  - `detect_scenes(path: Path, threshold: float = 0.30) -> list[SceneScore]`
-    via the `scdet` filter, parsing the per-frame score from its log output.
-  - `diff_hash(png_bytes: bytes) -> int` and
-    `hamming(a: int, b: int) -> int`.
+  - `detect_scenes(path: Path, threshold: float = 10.0) -> list[SceneScore]`
+    via the `scdet` filter, parsing its log output. Both numbers in each line
+    are in score units, and `scdet` emits at most one line per second of media.
+  - `diff_hash_of(raw: bytes) -> int` and
+    `hamming(a: int, b: int) -> int`, plus
+    `diff_hash(png_bytes: bytes) -> int` which downscales to 32x32 grayscale
+    first. All three are pure and testable without a video.
   - `sample_candidates(scenes, duration, interval=3, dedup_distance=6,
-    extract=lambda t: b"") -> list[Candidate]`
+    extract: Callable[[float], int] = lambda t: 0) -> list[Candidate]`, where
+    `extract` returns the perceptual hash of the frame at a timestamp.
   - `rank_candidates(candidates, audio_events, budget=120) -> tuple[list[Candidate], dict[str, int]]`
     returning the kept candidates and accounting
     `{"scene": n, "audio": n, "interval": n, "fill": n, "dropped": n}`.
@@ -559,8 +574,11 @@ git add -A && git commit -m "feat(media): bounded cancellable subprocess runner"
 
 ```python
 def test_scene_scores_are_parsed_from_a_real_clip(tmp_path):
-    scores = media.detect_scenes(make_sample(tmp_path / "cuts.mp4", duration=8))
-    assert all(0.0 <= s.score <= 1.0 for s in scores)
+    sample = make_sample(tmp_path / "cuts.mp4", duration=8, counter_jump_at=4)
+    scores = media.detect_scenes(sample)
+    assert scores, "a clip with a hard cut must yield at least one scored second"
+    assert max(s.score for s in scores) >= 10.0, "the hard cut must clear the default threshold"
+    assert all(s.timestamp >= 0.0 for s in scores)
 
 
 def test_dedup_drops_near_identical_candidates():
@@ -593,11 +611,11 @@ Expected: FAIL, missing `detect_scenes`.
 
 `detect_scenes` runs
 `ffmpeg -i <path> -vf scdet=threshold=<t> -f null -` and parses
-`lavfi.scd.score` pairs from stderr. `diff_hash` decodes a 32x32 grayscale
-difference image; keep it dependency-free by shelling to ffmpeg for the
-downscale and hashing the raw bytes it returns. The constants `interval = 3`
-and `dedup_distance = 6` live as module-level names so the spec's "one module"
-rule holds.
+`lavfi.scd.score: <score>, lavfi.scd.time: <second>` from stderr, treating the
+score as opaque and the time as the candidate second. `diff_hash` downscales to
+32x32 grayscale by shelling to ffmpeg and hashes the raw bytes it returns, so no
+image library is added. The constants `interval = 3` and `dedup_distance = 6`
+live as module-level names so the spec's "one module" rule holds.
 
 - [ ] **Step 4: Run the tests again**
 
@@ -672,8 +690,8 @@ def test_out_of_bounds_crop_is_rejected_with_measured_size(tmp_path):
     assert str(probe_of(src).width) in str(err.value)
 
 
-def test_missing_font_yields_unlabelled_tiles(tmp_path):
-    os.environ["MEDIA_FONT_FILE"] = "/nonexistent/font.ttf"
+def test_missing_font_yields_unlabelled_tiles(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEDIA_FONT_FILE", "/nonexistent/font.ttf")
     assert media.resolve_font() is None
     assert media.render_sheet(frames, labels=True, max_edge=400) is not None
 
@@ -696,8 +714,9 @@ Extraction is one `ffmpeg` call per requested timestamp with
 and, when a box is given, a `crop` filter before the scale. Auto crop runs one
 ffmpeg pass over the window producing a tiled downscale, then unions the
 differing regions over a threshold. Tiling composites PIL-free by generating a
-single `ffmpeg` filter graph with `xstack` (sheet) or `vstack` (filmstrip) and
-`drawtext` per tile when labels are enabled. Encode to JPEG q85 only when the
+single `ffmpeg` filter graph with `xstack` (sheet) or `vstack` (filmstrip), and
+labels are burned per input with the `ass` filter from a generated ASS file,
+positioned in the top-left corner of each tile. Encode to JPEG q85 only when the
 PNG exceeds `2 MiB`, and report both limits when they trigger.
 
 - [ ] **Step 4: Run the tests again**
@@ -982,7 +1001,11 @@ mv ~/.config/opencode/skills/transcribe-diarize/.venv transcribe/
 ```
 Expected: `transcribe/transcribe.sh --help` exits 0 using the skill's `.env`
 for `HF_TOKEN`; if the wrapper resolved `.env` relative to its old location,
-fix the path resolution in this task and record the change.
+fix the path resolution in this task and record the change. The secrets stay
+where they are: `.env` remains in the skill directory (design section 15 step 4),
+the moved wrapper resolves it through `MEDIA_TRANSCRIBE_ENV` with that skill
+path as the default, and the repository ignores `.env` so no token can ever be
+committed.
 
 - [ ] **Step 2: Write the failing regression test**
 
