@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -341,3 +342,182 @@ def _youtube_video_id(parsed: Any) -> str | None:
 def _normalized_watch_url(video_id: str) -> str:
     params = urlencode({"v": video_id})
     return f"https://www.youtube.com/watch?{params}"
+
+
+# ---------------------------------------------------------------------------
+# Timeline projection and pure search
+# ---------------------------------------------------------------------------
+
+# The layer vocabulary of the timeline. Every pipeline stage projects its
+# events into exactly one of these layers; anything else is refused at
+# construction, so an unknown layer can never reach the file.
+TIMELINE_LAYERS = frozenset({"scene", "audio", "speech", "ocr", "ocr-change"})
+
+# `search` returns at most this many hits regardless of the requested `k`.
+_SEARCH_K_CAP = 20
+
+# Which timeline layers each search scope looks at. The timeline carries the
+# projection, never the source file names, so "transcript" means the speech
+# lines and "ocr" means both OCR layers.
+_SCOPE_LAYERS = {
+    "all": TIMELINE_LAYERS,
+    "transcript": frozenset({"speech"}),
+    "ocr": frozenset({"ocr", "ocr-change"}),
+}
+
+# The line format `write_timeline` emits and `search` parses. Everything about
+# it is fixed-width by design, which is what makes malformed lines detectable
+# instead of silently accepted.
+_TIMELINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{3})\] (\S+) \| (.*)$")
+
+# A token for scoring: a run of word characters, compared lowercased.
+_TOKEN_PATTERN = re.compile(r"\w+")
+
+
+@dataclass(frozen=True)
+class TimelineEvent:
+    """One projected moment in `timeline.md`.
+
+    `timestamp` is a float position in seconds in the source's content time;
+    `layer` is one of `TIMELINE_LAYERS`; `payload` is short human-readable
+    content such as a transcript segment's text or an OCR string.
+    """
+
+    timestamp: float
+    layer: str
+    payload: str
+
+    def __post_init__(self) -> None:
+        if self.layer not in TIMELINE_LAYERS:
+            allowed = ", ".join(sorted(TIMELINE_LAYERS))
+            raise ValueError(
+                f"unknown timeline layer {self.layer!r} (expected one of: {allowed})"
+            )
+
+
+def format_timestamp(seconds: float) -> str:
+    """Format seconds in the source's content time as `HH:MM:SS.mmm`.
+
+    This is the one timestamp format of the project: the timeline writer, the
+    transcript writer, and the search parser all go through it so timestamps
+    read the same wherever an agent meets them. Values below zero clamp to
+    zero rather than producing a negative-looking stamp.
+    """
+    total_ms = max(round(seconds * 1000), 0)
+    hours, rest = divmod(total_ms, 3_600_000)
+    minutes, rest = divmod(rest, 60_000)
+    secs, millis = divmod(rest, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def write_timeline(entry: Path, events: list[TimelineEvent]) -> Path:
+    """Write the entry's `timeline.md` as the projection of `events`.
+
+    One line per event, sorted by timestamp (stable sort, so events at the
+    same timestamp keep the caller's order), in the format
+    `[HH:MM:SS.mmm] layer | payload`. Each call rewrites the whole file from
+    the events it is given: identical inputs therefore produce byte-identical
+    output, and a repeated projection can never accumulate duplicated lines.
+    Callers that grow a timeline per stage project the entry's full event list
+    each time, one stage's events per layer at a time.
+    """
+    ordered = sorted(events, key=lambda event: event.timestamp)
+    path = stage_path(entry, "timeline.md")
+    path.write_text(
+        "".join(_timeline_line(event) + "\n" for event in ordered), encoding="utf-8"
+    )
+    return path
+
+
+def _timeline_line(event: TimelineEvent) -> str:
+    """Render one event line; payloads with line breaks stay on one line."""
+    payload = event.payload.replace("\r", " ").replace("\n", " ")
+    return f"[{format_timestamp(event.timestamp)}] {event.layer} | {payload}"
+
+
+@dataclass(frozen=True)
+class Hit:
+    """One ranked result of `search`: a timestamp, a layer, text, a score.
+
+    `text` is the matched line's payload. `score` is the fraction of the
+    query's tokens found in it, so a full overlap is 1.0 and a single-token
+    query either matches fully or not at all.
+    """
+
+    timestamp: float
+    layer: str
+    text: str
+    score: float
+
+
+def search(entry: Path, query: str, k: int = 8, scope: str = "all") -> list[Hit]:
+    """Rank the entry's timeline lines by case-insensitive token overlap.
+
+    The timeline carries the projection of the transcript segments and the
+    per-frame OCR results, so one line-by-line scan covers both sources: a
+    `scope` of `"transcript"` looks at the speech layer, `"ocr"` at both OCR
+    layers, `"all"` at everything. At most `k` hits return, hard-capped at
+    20. Ordering is score descending, then earlier timestamp first, then line
+    number; because lines are already chronological, the stable sort makes
+    repeated runs produce identical output. A missing timeline, a `k` of
+    zero, or a query without tokens simply returns no hits; a malformed line
+    is skipped with its line number kept so it can never perturb the ranking.
+    """
+    if scope not in _SCOPE_LAYERS:
+        allowed = ", ".join(sorted(_SCOPE_LAYERS))
+        raise ValueError(f"unknown search scope {scope!r} (expected one of: {allowed})")
+    limit = min(k, _SEARCH_K_CAP)
+    if limit <= 0:
+        return []
+    query_tokens = _token_set(query)
+    if not query_tokens:
+        return []
+    path = Path(entry) / "timeline.md"
+    if not path.is_file():
+        return []
+    wanted = _SCOPE_LAYERS[scope]
+    hits: list[Hit] = []
+    with path.open(encoding="utf-8") as stream:
+        # Line-by-line: the file is scanned in streaming order and never held
+        # in memory; insertion order below is line order, which is what the
+        # sort's stability turns into the "then line number" tie-break.
+        for raw in stream:
+            parsed = _split_timeline_line(raw)
+            if parsed is None:
+                continue
+            timestamp, layer, payload = parsed
+            if layer not in wanted:
+                continue
+            overlap = _token_set(payload) & query_tokens
+            if not overlap:
+                continue
+            score = len(overlap) / len(query_tokens)
+            hits.append(Hit(timestamp, layer, payload, score))
+    hits.sort(key=lambda hit: (-hit.score, hit.timestamp))
+    return hits[:limit]
+
+
+def _split_timeline_line(raw: str) -> tuple[float, str, str] | None:
+    """Parse `[HH:MM:SS.mmm] layer | payload`, or None for a malformed line."""
+    matched = _TIMELINE_PATTERN.match(raw.rstrip("\n"))
+    if matched is None:
+        return None
+    seconds = _seconds_from_timestamp(matched.group(1))
+    if seconds is None:
+        return None
+    return seconds, matched.group(2), matched.group(3)
+
+
+def _seconds_from_timestamp(stamped: str) -> float | None:
+    """Parse the `HH:MM:SS.mmm` form back to seconds, or None."""
+    try:
+        hours, minutes, rest = stamped.split(":")
+        whole, fraction = rest.split(".")
+    except ValueError:
+        return None
+    return int(hours) * 3600 + int(minutes) * 60 + int(whole) + int(fraction) / 1000
+
+
+def _token_set(text: str) -> frozenset[str]:
+    """Return the lowercased word-character tokens of `text`."""
+    return frozenset(_TOKEN_PATTERN.findall(text.lower()))
