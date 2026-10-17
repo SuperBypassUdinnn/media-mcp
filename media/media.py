@@ -120,6 +120,16 @@ _LABEL_FONT_REFERENCE_WIDTH = 320
 _LABEL_FONT_REFERENCE_SIZE = 40
 _LABEL_FONT_SIZE_MIN = 12
 
+# OCR: the columns of tesseract's TSV report (level page_num block_num
+# par_num line_num word_num left top width height conf text), the numeric
+# token every tracked value is extracted with, and tesseract's own stderr
+# shapes for an uninstalled language pack, measured on this host
+# (tesseract 5.5.3): `Error opening data file
+# /usr/share/tessdata/zzz.traineddata` and `Failed loading language 'zzz'`.
+_TSV_COLUMNS = 12
+_VALUE_TOKEN = re.compile(r"\d+(?:\.\d+)?")
+_MISSING_LANGUAGE_MARKERS = ("Failed loading language", "Error opening data file")
+
 
 class MediaError(RuntimeError):
     """The error type every media tool raises.
@@ -1727,3 +1737,179 @@ def _filter_quote(value: Path) -> str:
     """Quote a filesystem path for use inside an ffmpeg filter argument."""
     escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
     return f"'{escaped}'"
+
+
+# OCR and value tracking ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OcrResult:
+    """One frame's recognized text with the mean confidence of its words.
+
+    `timestamp` is the media-time second the frame represents. `ocr_png`
+    receives only pixels, so it stamps 0.0 and the caller records the real
+    timestamp where it stores the result. `confidence` is the mean of the
+    kept word confidences scaled from tesseract's percent into 0..1, and
+    0.0 when the frame carried no readable word at all — an unreadable
+    frame is a result, never an error.
+    """
+
+    timestamp: float
+    text: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class ChangeCandidate:
+    """One frame whose tracked number glitches against both its neighbours.
+
+    `value` is the candidate's own first numeric token, `before` and `after`
+    are the neighbouring valued frames' tokens, and `timestamp` and
+    `confidence` are the candidate frame's own. A one-frame glitch reports
+    with the stable value on both sides; a held step change is not a
+    candidate because the new value equals its next neighbour.
+    """
+
+    timestamp: float
+    value: str
+    before: str
+    after: str
+    confidence: float
+
+
+def ocr_available_langs() -> list[str]:
+    """Return the languages `tesseract --list-langs` reports, in its order.
+
+    The first line is tesseract's header (the tessdata directory and the
+    count); every following non-blank line is a language code, kept exactly
+    as printed. A non-zero exit raises `MediaError` carrying the exit code
+    and the captured stderr.
+    """
+    done = run_child(["tesseract", "--list-langs"], timeout_seconds=60)
+    if done.returncode != 0:
+        raise MediaError(
+            "tesseract could not list its languages: exited "
+            f"{done.returncode}; captured stderr: {done.stderr.strip() or '(none)'}"
+        )
+    lines = [line.strip() for line in done.stdout.splitlines()]
+    return [code for code in lines[1:] if code]
+
+
+def ocr_png(png_bytes: bytes, psm: int = 6, lang: str = "eng") -> OcrResult:
+    """Recognize the text of one PNG frame through tesseract over its pipes.
+
+    The image travels in on stdin and the TSV report comes out on stdout
+    (`tesseract - - -l <lang> --psm <psm> tsv` through `run_child`), so the
+    frame never touches a temporary file and no shell is involved. `psm` is
+    tesseract's page segmentation mode and `lang` its language code. The
+    `timestamp` this returns is 0.0 on purpose: `png_bytes` carries no
+    timeline, and the caller stamps the real timestamp where it stores the
+    result.
+
+    A missing language pack is detected from tesseract's stderr and raised
+    as a `MediaError` carrying its first stderr line plus the languages
+    `ocr_available_langs` reports, so the caller can name an installed one
+    without a second round-trip; any other non-zero exit raises
+    `MediaError` with the captured stderr. A frame with nothing readable in
+    it comes back as empty text with 0.0 confidence, never an error.
+    """
+    argv = ["tesseract", "-", "-", "-l", lang, "--psm", str(int(psm)), "tsv"]
+    done = run_child(argv, stdin_bytes=png_bytes)
+    if done.returncode != 0:
+        raise _ocr_failure(done, lang)
+    # With `stdin_bytes` given, run_child decodes stdout one byte per
+    # latin-1 code point — a strict bijection — so encoding back recovers
+    # tesseract's exact UTF-8 bytes for a faithful decode.
+    tsv = done.stdout.encode("latin-1").decode("utf-8", "replace")
+    text, confidence = _parse_tesseract_tsv(tsv)
+    return OcrResult(timestamp=0.0, text=text, confidence=confidence)
+
+
+def track_values(results: list[OcrResult]) -> list[ChangeCandidate]:
+    """Return the frames whose tracked number glitches against both sides.
+
+    Only frames whose text carries a numeric token are valued: the value is
+    the first integer-or-decimal token (`\\d+(?:\\.\\d+)?`) in the frame's
+    text, and frames without one drop out of the sequence entirely. A
+    valued frame is a candidate when its value differs from both its
+    immediate previous and its immediate next valued neighbour, so a
+    one-frame glitch reports with the stable value on both sides, a held
+    step change reports nothing (the new value equals its next neighbour),
+    and the first and last valued frames can never be candidates. The
+    candidate's `value`, `timestamp`, and `confidence` are its own;
+    `before` and `after` are the neighbours' values. Input order is
+    preserved, and empty or single-entry sequences return `[]`.
+    """
+    valued: list[tuple[OcrResult, str]] = []
+    for result in results:
+        match = _VALUE_TOKEN.search(result.text)
+        if match is not None:
+            valued.append((result, match.group(0)))
+    return [
+        ChangeCandidate(
+            timestamp=valued[index][0].timestamp,
+            value=valued[index][1],
+            before=valued[index - 1][1],
+            after=valued[index + 1][1],
+            confidence=valued[index][0].confidence,
+        )
+        for index in range(1, len(valued) - 1)
+        if valued[index][1] != valued[index - 1][1]
+        and valued[index][1] != valued[index + 1][1]
+    ]
+
+
+def _ocr_failure(done: CompletedProcess[str], lang: str) -> MediaError:
+    """Build the `MediaError` for a failed tesseract run, by cause.
+
+    An uninstalled language pack leaves the two measured stderr shapes
+    behind; that case reports tesseract's first stderr line plus the
+    languages that are installed, so the caller can correct `lang` against
+    measured facts. Any other failure carries the exit code and the
+    captured stderr verbatim.
+    """
+    stderr = done.stderr.strip()
+    if any(marker in stderr for marker in _MISSING_LANGUAGE_MARKERS):
+        first_line = next((line for line in stderr.splitlines() if line.strip()), "")
+        available = ", ".join(ocr_available_langs()) or "(none)"
+        return MediaError(
+            f"tesseract has no language pack {lang!r}: {first_line}; "
+            f"available languages: {available}"
+        )
+    return MediaError(
+        f"tesseract OCR failed (exit code {done.returncode}); "
+        f"captured stderr: {stderr or '(none)'}"
+    )
+
+
+def _parse_tesseract_tsv(tsv: str) -> tuple[str, float]:
+    """Rebuild the page text and mean word confidence from tesseract's TSV.
+
+    Structure rows (page, block, paragraph, line levels) carry conf -1 and
+    empty text and are dropped; the kept word rows are grouped by their
+    `(block_num, par_num, line_num)` coordinates in first-appearance order,
+    the words of a line join with single spaces, and the lines join with
+    newlines — tesseract's own reading order. `confidence` is the mean kept
+    word confidence divided by 100, so it lands in 0..1; a page with no
+    kept word yields `("", 0.0)`.
+    """
+    words_by_line: dict[tuple[str, str, str], list[str]] = {}
+    confidences: list[float] = []
+    for row in tsv.splitlines()[1:]:
+        fields = row.split("\t", _TSV_COLUMNS - 1)
+        if len(fields) < _TSV_COLUMNS:
+            continue
+        text = fields[11].strip()
+        if not text:
+            continue
+        try:
+            confidence = float(fields[10])
+        except ValueError:
+            continue
+        if confidence < 0.0:
+            continue
+        words_by_line.setdefault((fields[2], fields[3], fields[4]), []).append(text)
+        confidences.append(confidence)
+    text = "\n".join(" ".join(words) for words in words_by_line.values())
+    mean = sum(confidences) / len(confidences) / 100.0 if confidences else 0.0
+    return text, mean

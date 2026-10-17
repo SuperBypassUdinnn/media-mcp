@@ -198,6 +198,75 @@ def make_motion_patch(
     return path
 
 
+def make_value_flicker(
+    path: Path,
+    *,
+    duration: int = 8,
+    base: str = "80",
+    flick: str = "48",
+    flick_at: float = 4.0,
+    flick_seconds: float = 1.0,
+    size: tuple[int, int] = VIDEO_SIZE,
+    rate: int = VIDEO_RATE,
+) -> Path:
+    """Write a static light-panel clip carrying exactly one flickering number.
+
+    The panel shows `Nilai <base>` for the whole clip except a
+    `flick_seconds` window starting at `flick_at`, which shows `Nilai
+    <flick>` and then returns to the base. A `testsrc` background would put
+    motion in every frame and `make_sample`-style text plus counter would
+    put two numbers in frame, making the first numeric token ambiguous; so
+    the background is a motionless color and the one value line is the only
+    text on the panel. The clip exists so value tracking can be tested
+    against real OCR with a known ground truth: exactly one glitch, at
+    `flick_at`, back to the base after `flick_seconds`.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    width, height = size
+    panel_height = height // 3
+
+    with tempfile.TemporaryDirectory(dir=path.parent) as scratch:
+        ass_path = Path(scratch) / "flicker.ass"
+        ass_path.write_text(
+            _flicker_ass_document(size, duration, base, flick, flick_at, flick_seconds),
+            encoding="utf-8",
+        )
+        _run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                (
+                    f"color=c=0x202020:size={width}x{height}"
+                    f":rate={rate}:duration={duration}"
+                ),
+                "-vf",
+                (
+                    f"drawbox=x=0:y=0:w=iw:h={panel_height}"
+                    f":color=white@1:t=fill,"
+                    f"ass=filename={_filter_quote(ass_path)}"
+                ),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                str(path),
+            ]
+        )
+    return path
+
+
 def png_size(png_bytes: bytes) -> tuple[int, int]:
     """Return the (width, height) of a PNG stream, read from its IHDR chunk."""
     if png_bytes[:8] != _PNG_SIGNATURE:
@@ -324,6 +393,53 @@ def _ass_document(duration: int, text: str, jump: int | None) -> str:
         ", ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment"
         ", MarginL, MarginR, MarginV, Encoding\n"
         f"{styles}\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV"
+        ", Effect, Text\n" + "\n".join(events) + "\n"
+    )
+
+
+def _flicker_ass_document(
+    size: tuple[int, int],
+    duration: int,
+    base: str,
+    flick: str,
+    flick_at: float,
+    flick_seconds: float,
+) -> str:
+    """The ASS document for `make_value_flicker`: one line, three windows.
+
+    The same header, style, and black-on-white proven by `_ass_document`,
+    but exactly one Dialogue line at a time: the base value before
+    `flick_at`, the flick value across `[flick_at, flick_at +
+    flick_seconds)`, and the base value again until the clip ends.
+    """
+    width, height = size
+    stop = min(flick_at + flick_seconds, float(duration))
+    events = [
+        f"Dialogue: 0,{_ass_time(0)},{_ass_time(flick_at)},Text,,0,0,0,,Nilai {base}",
+        f"Dialogue: 0,{_ass_time(flick_at)},{_ass_time(stop)},Text,,0,0,0,,Nilai {flick}",
+        f"Dialogue: 0,{_ass_time(stop)},{_ass_time(duration)},Text,,0,0,0,,Nilai {base}",
+    ]
+    style = (
+        f"Style: Text,{FONT_NAME},{FONT_SIZE},&H00000000,&H00000000,&H00FFFFFF,&H00000000"
+        ",0,0,0,0,100,100,0,0,1,0,0,7,60,60,40,1"
+    )
+    return (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {width}\n"
+        f"PlayResY: {height}\n"
+        "WrapStyle: 2\n"
+        "ScaledBorderAndShadow: yes\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour"
+        ", OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX"
+        ", ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment"
+        ", MarginL, MarginR, MarginV, Encoding\n"
+        f"{style}\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV"
