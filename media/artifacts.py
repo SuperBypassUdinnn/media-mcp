@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -116,6 +119,117 @@ def stage_path(entry: Path, name: str) -> Path:
     target = entry / name
     target.parent.mkdir(parents=True, exist_ok=True)
     return target
+
+
+# Floor for unreadable timestamps: `datetime.min` as an aware UTC value sorts
+# older than any real timestamp, so an entry without a usable `last_used` is
+# always the first candidate for eviction.
+_OLDEST = datetime.min.replace(tzinfo=UTC)
+
+
+def total_bytes(cache_root: Path) -> int:
+    """Return the recursive sum of file sizes under `<cache_root>/entries`.
+
+    Sizes come from `lstat`, so file symlinks count at their link size, never
+    at the size of their target, and `os.walk` with `followlinks=False` never
+    descends a symlinked directory. Together this keeps accounting inside the
+    cache root: a symlink into the source tree can never inflate the total.
+    """
+    entries_root = Path(cache_root) / "entries"
+    if not entries_root.is_dir():
+        return 0
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(entries_root, followlinks=False):
+        for name in filenames:
+            try:
+                total += (Path(dirpath) / name).lstat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def evict(cache_root: Path, cap_bytes: int, protect: Path | None = None) -> list[str]:
+    """Delete entry directories until the cache is within `cap_bytes`.
+
+    Entries are evicted oldest `last_used` first; entries with identical
+    `last_used` tie-break on cache key ascending so the result is
+    reproducible. Meta timestamps may be epoch numbers (what `touch` writes)
+    or ISO strings from hand-written meta; both parse to an aware UTC
+    `datetime` before comparison. A missing or malformed `meta.json` sorts as
+    older than any real timestamp and is therefore the first thing evicted.
+
+    `protect` is an entry directory whose contents are being read by the
+    caller; it is never deleted. Directories that cannot be removed stop the
+    loop rather than spin. No entry is ever deleted outside
+    `<cache_root>/entries`.
+
+    This layer runs single-process: the server serializes pipeline jobs, so
+    there is deliberately no locking around the scan-then-delete loop.
+    """
+    entries_root = Path(cache_root) / "entries"
+    protected = protect.resolve() if protect is not None else None
+    evicted: list[str] = []
+    while total_bytes(cache_root) > cap_bytes:
+        candidates = []
+        if entries_root.is_dir():
+            for child in entries_root.iterdir():
+                if not (child.is_dir() or child.is_symlink()):
+                    continue
+                if child.resolve() == protected:
+                    continue
+                candidates.append(child)
+        if not candidates:
+            break
+        candidates.sort(
+            key=lambda candidate: (_last_used_key(candidate), candidate.name)
+        )
+        target = candidates[0]
+        try:
+            if target.is_symlink():
+                # A symlink top-level target is unlinked, not recursed into.
+                target.unlink()
+            else:
+                shutil.rmtree(target)
+        except OSError:
+            break
+        evicted.append(target.name)
+    return evicted
+
+
+def _last_used_key(entry: Path) -> datetime:
+    """Return the entry's usable `last_used` as an aware UTC `datetime`."""
+    try:
+        meta = read_meta(entry)
+    except (OSError, ValueError, TypeError):
+        return _OLDEST
+    if not isinstance(meta, dict):
+        return _OLDEST
+    return _timestamp_as_datetime(meta.get("last_used"))
+
+
+def _timestamp_as_datetime(value: object) -> datetime:
+    """Coerce a meta timestamp value to an aware UTC `datetime`.
+
+    Accepts epoch numbers (seconds, as `touch` writes them) and ISO-8601
+    strings (naive ones are read as UTC). Anything else, including a value
+    that cannot be parsed or represents an out-of-range epoch, is `_OLDEST`.
+    """
+    if isinstance(value, bool):
+        return _OLDEST
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            return _OLDEST
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.strip())
+        except ValueError:
+            return _OLDEST
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed
+    return _OLDEST
 
 
 def _detail_string(detail: dict[str, object]) -> str:

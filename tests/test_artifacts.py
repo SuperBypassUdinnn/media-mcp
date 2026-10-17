@@ -150,3 +150,85 @@ def test_meta_json_persists_as_json(tmp_path, sample):
     artifacts.write_meta(entry, {"created": 7.0, "last_used": 7.0, "bytes": 128})
     on_disk = json.loads((entry / "meta.json").read_text(encoding="utf-8"))
     assert on_disk == {"created": 7.0, "last_used": 7.0, "bytes": 128}
+
+
+def _entry(cache_root: Path, key: str, last_used: float | str | None) -> Path:
+    """Create a real cache entry with a payload file via the artifacts API.
+
+    A `None` `last_used` leaves the entry without `meta.json` at all, which is
+    how a crashed pre-Task-3 job would leave an entry behind.
+    """
+    ident = artifacts.Identity(
+        key=key, kind="file-sampled", source=key, detail={"kind": "file-sampled"}
+    )
+    entry = artifacts.entry_dir(ident, cache_root)
+    artifacts.stage_path(entry, "blob.bin").write_bytes(b"x" * 1024)
+    if last_used is not None:
+        artifacts.write_meta(entry, {"created": last_used, "last_used": last_used})
+    return entry
+
+
+def test_total_bytes_sums_entry_payloads(tmp_path):
+    assert artifacts.total_bytes(tmp_path) == 0
+    entry = _entry(tmp_path, "0" * 16, 1.0)
+    assert artifacts.total_bytes(tmp_path) >= 1024
+    artifacts.stage_path(entry, "frames/").mkdir(exist_ok=True)
+    (entry / "frames" / "0.png").write_bytes(b"y" * 500)
+    total = artifacts.total_bytes(tmp_path)
+    assert 1024 + 500 <= total <= 1024 + 500 + 512  # meta.json is small
+
+
+def test_eviction_drops_oldest_last_used_first(tmp_path):
+    keys = {}
+    for name, key, used in (
+        ("old", "0" * 16, 1.0),
+        ("mid", "1" * 16, 2.0),
+        ("new", "2" * 16, 3.0),
+    ):
+        keys[name] = _entry(tmp_path, key, used)
+    evicted = artifacts.evict(tmp_path, cap_bytes=2500)
+    assert keys["old"].name in evicted
+    assert not keys["old"].exists()
+    assert keys["mid"].exists() and keys["mid"].name not in evicted
+    assert keys["new"].exists()
+
+
+def test_eviction_protects_the_current_entry(tmp_path):
+    keys = {}
+    for name, key, used in (
+        ("old", "0" * 16, 1.0),
+        ("mid", "1" * 16, 2.0),
+        ("new", "2" * 16, 3.0),
+    ):
+        keys[name] = _entry(tmp_path, key, used)
+    evicted = artifacts.evict(tmp_path, cap_bytes=0, protect=keys["new"])
+    assert keys["old"].name in evicted and not keys["old"].exists()
+    assert keys["mid"].name in evicted and not keys["mid"].exists()
+    assert keys["new"].exists() and keys["new"].name not in evicted
+
+
+def test_eviction_stops_when_under_cap(tmp_path):
+    for key, used in (("0" * 16, 1.0), ("1" * 16, 2.0), ("2" * 16, 3.0)):
+        _entry(tmp_path, key, used)
+    assert artifacts.evict(tmp_path, cap_bytes=10_000) == []
+
+
+def test_eviction_treats_missing_or_malformed_meta_as_oldest(tmp_path):
+    bad = _entry(tmp_path, "0" * 16, None)
+    (bad / "meta.json").write_text("{not json", encoding="utf-8")
+    none = _entry(tmp_path, "1" * 16, None)
+    a = _entry(tmp_path, "2" * 16, 1000.0)
+    b = _entry(tmp_path, "3" * 16, 2000.0)
+    evicted = artifacts.evict(tmp_path, cap_bytes=2000)
+    assert evicted[0] == bad.name and not bad.exists()
+    assert evicted[1] == none.name and not none.exists()
+    assert a.name in evicted and not a.exists()
+    assert b.exists() and b.name not in evicted
+
+
+def test_eviction_parses_string_last_used(tmp_path):
+    old = _entry(tmp_path, "0" * 16, "2024-01-01T00:00:00")
+    new = _entry(tmp_path, "1" * 16, "2026-01-01T00:00:00")
+    evicted = artifacts.evict(tmp_path, cap_bytes=1500)
+    assert evicted == [old.name]
+    assert new.exists() and new.name not in evicted
