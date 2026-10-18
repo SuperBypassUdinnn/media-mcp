@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import os
 import shutil
 import threading
@@ -29,6 +31,7 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.shared.exceptions import MCPError
 
+from media import artifacts
 from tests import fixtures
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -66,8 +69,15 @@ class ServerSession:
     `list_tools()` and `call()` methods the brief's tests use.
     """
 
-    def __init__(self, env: dict[str, str], stderr_path: Path, pidfile: Path) -> None:
+    def __init__(
+        self,
+        env: dict[str, str],
+        stderr_path: Path,
+        pidfile: Path,
+        markfile: Path,
+    ) -> None:
         self.pidfile = pidfile
+        self.markfile = markfile
         self._env = env
         self._loop = asyncio.new_event_loop()
         self._ready = threading.Event()
@@ -138,6 +148,18 @@ class ServerSession:
         ) as err:  # a protocol-level error the SDK raised
             return ToolCall(True, str(err), [])
         return _as_tool_call(result)
+
+    def call_async(self, name: str, arguments: dict | None = None):
+        """Submit a tool call without waiting, and return its future."""
+        assert self._session is not None
+        return self.submit(self._call_raw(name, arguments))
+
+    def invocations(self) -> int:
+        """How many times the fake pipeline was actually entered."""
+        if not self.markfile.is_file():
+            return 0
+        text = self.markfile.read_text(encoding="utf-8")
+        return len([line for line in text.splitlines() if line.strip()])
 
     def start_transcript(self, source: str, deadline: float = 15.0) -> int:
         """Start a transcript call in the background; return its child's pid."""
@@ -246,15 +268,17 @@ def _start_session(
     cache_dir = root / "cache"
     cache_dir.mkdir()
     pidfile = root / "fake-transcribe.pid"
+    markfile = root / "fake-transcribe.marks"
     env = {
         "MEDIA_CACHE_DIR": str(cache_dir),
         "MEDIA_TRANSCRIBE_BIN": str(_install_fake_transcribe(root)),
         "MEDIA_TRANSCRIBE_ENV": str(root / "transcribe.env"),
         "FAKE_TRANSCRIBE_PIDFILE": str(pidfile),
+        "FAKE_TRANSCRIBE_MARKFILE": str(markfile),
         "MEDIA_CALL_TIMEOUT_SECONDS": "120",
     }
     env.update(overrides)
-    return ServerSession(env, root / "server.stderr", pidfile)
+    return ServerSession(env, root / "server.stderr", pidfile, markfile)
 
 
 @pytest.fixture(scope="module")
@@ -306,6 +330,26 @@ def nofont_session(tmp_path_factory):
     session.close()
 
 
+@pytest.fixture(scope="module")
+def coalesce_session(tmp_path_factory):
+    """A session whose fake pipeline sleeps, so two calls truly overlap."""
+    session = _start_session(
+        tmp_path_factory, "coalesce", {"FAKE_TRANSCRIBE_SLEEP": "3"}
+    )
+    yield session
+    session.close()
+
+
+@pytest.fixture(scope="module")
+def small_cache_session(tmp_path_factory):
+    """A session with a tiny cache cap, so a heavy job must evict to fit."""
+    session = _start_session(
+        tmp_path_factory, "small-cap", {"MEDIA_CACHE_CAP": "500000"}
+    )
+    yield session
+    session.close()
+
+
 @pytest.fixture
 def sample(tmp_path):
     return fixtures.make_sample(tmp_path / "sample.mp4", duration=4, counter_jump_at=2)
@@ -342,6 +386,17 @@ def test_manifest_response_ends_with_a_status_block(server_session, sample):
     assert text.strip().splitlines()[-1].startswith("skipped:")
 
 
+def test_a_cut_free_clip_reports_no_scene_change_reached_the_threshold(
+    server_session, tmp_path
+):
+    """Motionless content cannot trip `scdet`, and the manifest says so."""
+    clip = fixtures.make_silent_video(tmp_path / "silent.mp4")
+    result = server_session.call("media_manifest", {"source": str(clip)})
+    assert not result.is_error, result.text
+    assert "No scene change reached the threshold." in result.text
+    assert "0 scene boundary candidate" in result.text
+
+
 # Lifecycle: no child may outlive the session --------------------------------------
 
 
@@ -365,6 +420,24 @@ def test_probe_reports_measurements_and_stage_costs(server_session, sample):
     for weight in ("light", "medium", "heavy"):
         assert weight in result.text.lower()
     assert result.text.strip().splitlines()[-1].startswith("skipped:")
+
+
+def test_probe_names_the_container_layout_and_both_stream_start_times(
+    server_session, sample
+):
+    result = server_session.call("media_probe", {"source": str(sample)})
+    assert not result.is_error, result.text
+    lowered = result.text.lower()
+    assert "container" in lowered
+    assert "mp4" in result.text
+    assert "audio layout" in lowered and "mono" in lowered
+    start_line = next(
+        line
+        for line in result.text.splitlines()
+        if line.lower().startswith("stream start_time")
+    )
+    assert "video=" in start_line and "audio=" in start_line
+    assert "audio-video offset" in start_line
 
 
 def test_manifest_digest_tables_and_the_loudness_gate(server_session, sample):
@@ -409,6 +482,45 @@ def test_frames_sheet_mode_writes_one_composite(server_session, sample):
     assert not result.is_error, result.text
     paths = _frame_paths(result.text)
     assert len(paths) == 1 and paths[0].is_file()
+
+
+def test_frames_with_only_a_source_returns_the_default_contact_sheet(
+    server_session, sample
+):
+    """`at` defaults to 'scenes', whose tile mode is a single contact sheet."""
+    result = server_session.call("media_frames", {"source": str(sample)})
+    assert not result.is_error, result.text
+    assert "sheet" in result.text.lower()
+    paths = _frame_paths(result.text)
+    assert len(paths) == 1 and paths[0].is_file()
+
+
+def test_ocr_with_only_a_source_runs_instead_of_demanding_a_timestamp(
+    server_session, sample
+):
+    """`at` defaults to 'scenes' for media_ocr too."""
+    result = server_session.call("media_ocr", {"source": str(sample)})
+    assert not result.is_error, result.text
+    assert "a timestamp is required" not in result.text.lower()
+    assert "Recognized text per timestamp" in result.text
+
+
+def test_frames_on_an_audio_only_source_names_the_missing_video_stream(
+    server_session, tmp_path
+):
+    clip = fixtures.make_audio_only(tmp_path / "audio-only-frames.m4a")
+    result = server_session.call("media_frames", {"source": str(clip)})
+    assert result.is_error, result.text
+    assert "no video stream" in result.text.lower(), result.text
+
+
+def test_ocr_on_an_audio_only_source_names_the_missing_video_stream(
+    server_session, tmp_path
+):
+    clip = fixtures.make_audio_only(tmp_path / "audio-only-ocr.m4a")
+    result = server_session.call("media_ocr", {"source": str(clip)})
+    assert result.is_error, result.text
+    assert "no video stream" in result.text.lower(), result.text
 
 
 def test_frames_without_a_usable_font_still_return_images(nofont_session, sample):
@@ -458,6 +570,28 @@ def test_transcript_reports_tier_and_artifact_paths(server_session, sample):
     assert "tier" in result.text.lower()
 
 
+def test_concurrent_transcripts_coalesce_onto_one_pipeline_run(
+    coalesce_session, sample
+):
+    """Two overlapping calls for one source run the pipeline exactly once."""
+    first = coalesce_session.call_async("media_transcript", {"source": str(sample)})
+    assert _wait_for_file(coalesce_session.pidfile, 15.0), (
+        "the first transcript job never reached the pipeline"
+    )
+    second = coalesce_session.call_async("media_transcript", {"source": str(sample)})
+    first_result = _as_tool_call(first.result(timeout=120))
+    second_result = _as_tool_call(second.result(timeout=120))
+    assert not first_result.is_error, first_result.text
+    assert not second_result.is_error, second_result.text
+    assert coalesce_session.invocations() == 1, (
+        "the second identical call re-ran the pipeline instead of reusing the "
+        "cache entry"
+    )
+    assert "transcript.json" in _cache_line(second_result.text), second_result.text
+    assert "waited for transcribe.lock" in second_result.text
+    assert "held by" in second_result.text and "pid " in second_result.text
+
+
 def test_a_timeout_is_an_error_result_naming_the_timeout(timeout_session, sample):
     result = timeout_session.call("media_transcript", {"source": str(sample)})
     assert result.is_error
@@ -482,6 +616,111 @@ def test_search_names_the_missing_stages_and_then_finds_speech(server_session, s
     assert "00:00:00.000" in found.text
     assert "halo" in found.text.lower()
     assert "speech" in found.text.lower()
+
+
+def test_search_finds_a_cached_ocr_record_by_its_text(server_session, sample):
+    """`scope="ocr"` reads the `<entry>/ocr/*.json` records `media_ocr` wrote."""
+    ocr = server_session.call("media_ocr", {"source": str(sample), "at": [1.0]})
+    assert not ocr.is_error, ocr.text
+
+    found = server_session.call(
+        "media_search",
+        {"source": str(sample), "query": "LANJUT", "scope": "ocr"},
+    )
+    assert not found.is_error, found.text
+    assert "LANJUT" in found.text.upper()
+    assert "00:00:01.000" in found.text
+    assert "ocr" in found.text.lower()
+
+
+def test_a_strict_transcript_records_its_own_identity_in_meta(server_session, tmp_path):
+    """A strict run's meta.json carries the strict identity, not the sampled one."""
+    # A clip of its own: the strict identity hashes content only, so two
+    # byte-identical fixtures in different tests would share one cache entry.
+    clip = fixtures.make_sample(
+        tmp_path / "strict-sample.mp4", duration=5, counter_jump_at=3
+    )
+    result = server_session.call(
+        "media_transcript", {"source": str(clip), "identity": "strict"}
+    )
+    assert not result.is_error, result.text
+    strict = artifacts.resolve_source(str(clip), "strict")
+    sampled = artifacts.resolve_source(str(clip), "sampled")
+    assert strict.key != sampled.key
+    meta = _entry_meta(server_session, strict.key)
+    assert meta["identity"] == strict.key
+    assert meta["kind"] == "file-strict"
+
+
+def test_a_changed_identity_names_the_previous_entry_and_the_reason(
+    server_session, tmp_path
+):
+    """A new identity states the previous entry was not reused, and why."""
+    clip = fixtures.make_sample(tmp_path / "changed.mp4", duration=6, counter_jump_at=2)
+    first = server_session.call("media_probe", {"source": str(clip)})
+    assert not first.is_error, first.text
+    sampled = artifacts.resolve_source(str(clip), "sampled")
+    strict = artifacts.resolve_source(str(clip), "strict")
+
+    second = server_session.call(
+        "media_probe", {"source": str(clip), "identity": "strict"}
+    )
+    assert not second.is_error, second.text
+    assert sampled.key in second.text, second.text
+    assert strict.key in second.text
+    lowered = second.text.lower()
+    assert "not reused" in lowered
+    assert "identity changed" in lowered
+
+
+def test_a_repeated_identity_change_does_not_renotify_on_cache_hits(
+    server_session, tmp_path
+):
+    """Once the changed entry exists, a further call reports no change."""
+    clip = fixtures.make_sample(
+        tmp_path / "changed-again.mp4", duration=7, counter_jump_at=3
+    )
+    server_session.call("media_probe", {"source": str(clip)})
+    first_strict = server_session.call(
+        "media_probe", {"source": str(clip), "identity": "strict"}
+    )
+    assert "not reused" in first_strict.text.lower()
+    second_strict = server_session.call(
+        "media_probe", {"source": str(clip), "identity": "strict"}
+    )
+    assert "not reused" not in second_strict.text.lower()
+    assert "probe.json" in _cache_line(second_strict.text)
+
+
+def test_a_heavy_job_evicts_to_stay_within_the_cache_cap(small_cache_session, sample):
+    """Eviction runs after the job itself, with no media_cache(clean) call."""
+    cache_root = Path(small_cache_session._env["MEDIA_CACHE_DIR"])
+    cap = 500000
+    old = cache_root / "entries" / "0000000000000001"
+    old.mkdir(parents=True)
+    (old / "meta.json").write_text(
+        json.dumps(
+            {
+                "identity": "0000000000000001",
+                "kind": "file-sampled",
+                "source": "/old/clip.mp4",
+                "created": 1.0,
+                "last_used": 1.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (old / "blob.bin").write_bytes(b"\0" * 600000)
+    assert artifacts.total_bytes(cache_root) > cap
+
+    result = small_cache_session.call(
+        "media_frames", {"source": str(sample), "at": [1.0]}
+    )
+    assert not result.is_error, result.text
+    assert not old.exists(), "the older entry should have been evicted by the job"
+    assert artifacts.total_bytes(cache_root) <= cap
+    assert "evicted" in _cache_line(result.text), result.text
 
 
 def test_cache_lists_stats_and_cleans(server_session, sample):
@@ -539,6 +778,35 @@ def _frame_paths(text: str) -> list[Path]:
     return paths
 
 
+def _cache_line(text: str) -> str:
+    """Return the status block's `cache:` line, or `""` when it is absent."""
+    for line in text.splitlines():
+        if line.startswith("cache:"):
+            return line
+    return ""
+
+
+def _entry_meta(session: ServerSession, key: str) -> dict:
+    """Read an entry's `meta.json` by cache key."""
+    path = Path(session._env["MEDIA_CACHE_DIR"]) / "entries" / key / "meta.json"
+    assert path.is_file(), f"no meta.json for entry {key}"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _entry_for_source(session: ServerSession, source: Path) -> Path:
+    """Return the cache entry directory whose meta names `source`."""
+    entries = Path(session._env["MEDIA_CACHE_DIR"]) / "entries"
+    for child in sorted(entries.iterdir()):
+        meta_path = child / "meta.json"
+        if not meta_path.is_file():
+            continue
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        recorded = meta.get("source")
+        if isinstance(recorded, str) and Path(recorded).resolve() == source.resolve():
+            return child
+    raise AssertionError(f"no cache entry records the source {source}")
+
+
 def test_the_session_wrote_nothing_into_the_repository(server_session, sample):
     """The repository stays clean: artifacts land under the cache root only."""
     before = _repo_fingerprint()
@@ -548,11 +816,36 @@ def test_the_session_wrote_nothing_into_the_repository(server_session, sample):
     assert _repo_fingerprint() == before
 
 
-def _repo_fingerprint() -> set[str]:
+def test_the_repository_fingerprint_catches_an_in_place_rewrite(tmp_path):
+    """A same-size rewrite of one file is invisible to a path-set fingerprint."""
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("original\n", encoding="utf-8")
+    before = _repo_fingerprint(tmp_path)
+    tracked.write_text("modified\n", encoding="utf-8")
+    after = _repo_fingerprint(tmp_path)
+    assert set(after) == set(before), "the path set alone cannot tell them apart"
+    assert len("original\n") == len("modified\n")
+    assert after != before, "the fingerprint must hash content, not just names"
+
+
+def _repo_fingerprint(root: Path = REPO_ROOT) -> dict[str, str]:
+    """Fingerprint every file under `root` by relative path and content hash.
+
+    Content, not just the path set: the requirement this guards ("the server
+    writes only inside the cache entry") is violated just as much by an
+    in-place rewrite of a tracked file as by a new one, and only a hash sees
+    the difference. The venv, git metadata, and the interpreter/tooling caches
+    (`__pycache__`, `.pytest_cache`, `.ruff_cache`) stay excluded: they are not
+    the repository's deliverables, they are written by the test process and the
+    interpreter rather than by the server, and a `__pycache__` header can carry
+    the source file's mtime on interpreters that use timestamp invalidation, so
+    hashing them would make this test depend on the bytecode-cache mode.
+    """
+    excluded = {".venv", ".git", "__pycache__", ".pytest_cache", ".ruff_cache"}
     return {
-        str(path.relative_to(REPO_ROOT))
-        for path in REPO_ROOT.rglob("*")
-        if path.is_file() and ".venv" not in path.parts and ".git" not in path.parts
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in root.rglob("*")
+        if path.is_file() and not excluded.intersection(path.parts)
     }
 
 
@@ -571,3 +864,76 @@ def test_probe_json_is_cached_under_the_entry(server_session, sample):
     entries = list((Path(server_session._env["MEDIA_CACHE_DIR"]) / "entries").iterdir())
     assert entries, "the probe should have created a cache entry"
     assert (entries[0] / "probe.json").is_file()
+
+
+# The timeline projection (design lines 268 and 285) --------------------------------
+
+
+def _timeline_layers(timeline: Path) -> list[str]:
+    """Return the layer of every line of a projected `timeline.md`."""
+    return [
+        line.split("] ", 1)[1].split(" | ", 1)[0]
+        for line in timeline.read_text(encoding="utf-8").splitlines()
+        if line.startswith("[")
+    ]
+
+
+def test_a_manifest_projects_scene_and_audio_lines_into_the_timeline(
+    server_session, sample
+):
+    """The manifest rebuilds `timeline.md` from the entry's cached artifacts."""
+    result = server_session.call("media_manifest", {"source": str(sample)})
+    assert not result.is_error, result.text
+    timeline = _entry_for_source(server_session, sample) / "timeline.md"
+    assert timeline.is_file(), "a manifest must project the entry's timeline"
+    layers = _timeline_layers(timeline)
+    assert "scene" in layers and "audio" in layers
+    assert layers.count("scene") == 1
+
+
+def test_a_transcript_projects_speech_lines_into_the_timeline(server_session, sample):
+    """`media_transcript` projects its segments onto the `speech` layer."""
+    result = server_session.call("media_transcript", {"source": str(sample)})
+    assert not result.is_error, result.text
+    timeline = _entry_for_source(server_session, sample) / "timeline.md"
+    assert timeline.is_file(), "a transcript must project the entry's timeline"
+    text = timeline.read_text(encoding="utf-8")
+    assert "[00:00:00.000] speech | SPEAKER_00: halo" in text, text
+
+
+def test_an_ocr_track_run_records_a_candidate_that_a_manifest_keeps(
+    server_session, tmp_path
+):
+    """Track candidates are persisted, and a later rebuild does not erase them."""
+    clip = fixtures.make_value_flicker(
+        tmp_path / "flicker-timeline.mp4", flick_seconds=0.5
+    )
+    result = server_session.call(
+        "media_ocr",
+        {
+            "source": str(clip),
+            "at": 4.0,
+            "window": 1.0,
+            "fps": 2,
+            "track": True,
+        },
+    )
+    assert not result.is_error, result.text
+    entry = _entry_for_source(server_session, clip)
+    timeline = entry / "timeline.md"
+    assert timeline.is_file(), "an OCR run must project the entry's timeline"
+    projected = [
+        line
+        for line in timeline.read_text(encoding="utf-8").splitlines()
+        if line.startswith("[") and "ocr-change | " in line
+    ]
+    assert len(projected) == 1, projected
+    assert projected[0].startswith("[00:00:04.000] ocr-change | ")
+    assert "48" in projected[0]
+    assert (entry / "ocr_changes.json").is_file()
+
+    again = server_session.call("media_manifest", {"source": str(clip)})
+    assert not again.is_error, again.text
+    after = timeline.read_text(encoding="utf-8")
+    assert projected[0] in after, "a manifest rebuild must not erase track candidates"
+    assert "ocr | " in after, "the OCR records stay projected too"

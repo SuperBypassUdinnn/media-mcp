@@ -4,11 +4,12 @@
 # It mirrors the delegated contract without any transcription toolchain:
 # `--help` exits 0, an unknown flag is ignored rather than rejected, the
 # input's stem names one directory under `--out`, and four artifacts land
-# inside it. Four switches drive the failure and timing paths:
+# inside it. Five switches drive the failure and timing paths:
 #   FAKE_TRANSCRIBE_FAIL=1     exit 3 with a clear stderr line
 #   FAKE_TRANSCRIBE_PARTIAL=1  write every artifact except the .md
 #   FAKE_TRANSCRIBE_PIDFILE=FILE  write this script's own pid to FILE
 #   FAKE_TRANSCRIBE_SLEEP=SECONDS sleep before doing any work
+#   FAKE_TRANSCRIBE_MARKFILE=FILE append one line per real invocation
 set -eu
 
 usage() {
@@ -66,6 +67,12 @@ done
 
 if [ -n "${FAKE_TRANSCRIBE_PIDFILE:-}" ]; then
     printf '%s\n' "$$" >"${FAKE_TRANSCRIBE_PIDFILE}"
+fi
+
+# One line per real pipeline invocation, so a test can count the invocations
+# that reached this script rather than inferring them from responses.
+if [ -n "${FAKE_TRANSCRIBE_MARKFILE:-}" ]; then
+    printf 'invoked\n' >>"${FAKE_TRANSCRIBE_MARKFILE}"
 fi
 
 if [ -n "${FAKE_TRANSCRIBE_SLEEP:-}" ]; then

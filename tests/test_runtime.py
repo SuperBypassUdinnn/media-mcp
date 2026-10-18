@@ -94,6 +94,49 @@ def test_free_vram_mib_is_none_when_unmeasurable(monkeypatch):
     assert media.free_vram_mib() is None
 
 
+# The tier downgrade branch -------------------------------------------------------
+
+
+def _auto_settings(tmp_path, monkeypatch) -> server.Settings:
+    """Load `Settings` with the VRAM knobs at their documented defaults."""
+    monkeypatch.setenv("MEDIA_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("MEDIA_DEVICE", raising=False)
+    monkeypatch.delenv("MEDIA_VRAM_FLOOR", raising=False)
+    return server.load_settings()
+
+
+def test_the_tier_drops_to_medium_when_free_vram_is_below_the_floor(
+    tmp_path, monkeypatch
+):
+    """The measured MiB and the floor are both named in the downgrade reason."""
+    settings = _auto_settings(tmp_path, monkeypatch)
+    measured = settings.vram_floor_mib - 1
+    monkeypatch.setattr(media, "free_vram_mib", lambda: measured)
+    tier, device, rationale = server._choose_tier(settings, None, None)
+    assert (tier, device) == ("medium", "cpu")
+    assert f"{measured} MiB" in rationale
+    assert f"{settings.vram_floor_mib} MiB floor" in rationale
+
+
+def test_the_tier_drops_to_medium_when_free_vram_is_unmeasurable(tmp_path, monkeypatch):
+    """An unmeasurable driver is treated as below the floor, and says so."""
+    settings = _auto_settings(tmp_path, monkeypatch)
+    monkeypatch.setattr(media, "free_vram_mib", lambda: None)
+    tier, device, rationale = server._choose_tier(settings, None, None)
+    assert (tier, device) == ("medium", "cpu")
+    assert "unmeasurable" in rationale
+    assert f"{settings.vram_floor_mib} MiB" in rationale
+
+
+def test_the_top_tier_is_kept_at_exactly_the_vram_floor(tmp_path, monkeypatch):
+    """The floor is inclusive: free VRAM at the floor does not downgrade."""
+    settings = _auto_settings(tmp_path, monkeypatch)
+    monkeypatch.setattr(media, "free_vram_mib", lambda: settings.vram_floor_mib)
+    tier, device, rationale = server._choose_tier(settings, None, None)
+    assert (tier, device) == ("large-v3-turbo", "auto")
+    assert f"{settings.vram_floor_mib} MiB floor" in rationale
+
+
 # probe runs under the bounded runner --------------------------------------------
 
 

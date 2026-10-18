@@ -320,6 +320,11 @@ def _counted(count: int, noun: str) -> str:
     return f"{count} {noun}{'' if count == 1 else 's'}"
 
 
+def _stream_start(seconds: float | None) -> str:
+    """Render a stream's raw `start_time`, or `(absent)` when it has none."""
+    return "(absent)" if seconds is None else f"{seconds:.3f} s"
+
+
 def validate_count(
     value: object,
     default: int = COUNT_DEFAULT,
@@ -706,6 +711,23 @@ def _record_entry(entry: Path, identity: artifacts.Identity) -> None:
     artifacts.write_meta(entry, meta)
 
 
+def _evict_after_job(settings: Settings, entry: Path, report: _Report) -> None:
+    """Enforce `MEDIA_CACHE_CAP` now that this job's artifacts are on disk.
+
+    The design states the cap is enforced after each job and that eviction runs
+    once the current job finishes, so an in-flight job is never evicted
+    underneath itself: the entry this call just wrote is protected and every
+    other entry is a candidate, oldest `last_used` first. When entries were
+    removed the status block's `cache:` line carries the count, so a caller can
+    see that the cache shrank without running `media_cache(action="clean")`.
+    """
+    evicted = artifacts.evict(
+        settings.cache_dir, settings.cache_cap_bytes, protect=entry
+    )
+    if evicted:
+        report.cached.append(f"evicted {len(evicted)}")
+
+
 def _resolve_target(
     settings: Settings, source: str, identity: str
 ) -> tuple[artifacts.Identity, Path]:
@@ -738,10 +760,67 @@ def _resolve_target(
 
 def _entry_for(
     settings: Settings, source: str, identity: str
-) -> tuple[artifacts.Identity, Path, Path]:
+) -> tuple[artifacts.Identity, Path, Path, str | None]:
+    """Resolve a source to its identity, validated path, and cache entry.
+
+    The fourth value is a note stating that an older entry for the same source
+    with a different key was not reused, and why. Design section 12 requires
+    that sentence whenever a source resolves to a new entry, so the detection
+    lives here, at the one place every entry resolution passes through, and
+    every tool body surfaces the note in its status block.
+    """
     resolved, path = _resolve_target(settings, source, identity)
     entry = artifacts.entry_dir(resolved, settings.cache_dir)
-    return resolved, path, entry
+    return resolved, path, entry, _previous_entry_note(settings, entry, resolved)
+
+
+def _previous_entry_note(
+    settings: Settings, entry: Path, resolved: artifacts.Identity
+) -> str | None:
+    """Name an older entry for the same source that was not reused, or `None`.
+
+    Only a genuinely new entry is examined: an entry that already holds a
+    readable `meta.json` is this identity's own cache hit, and rescanning for a
+    previous entry on every cache hit would be work with no change to report.
+    Otherwise the cache is scanned for an entry whose recorded `source` (the
+    resolved path it was created from) matches and whose identity differs.
+    """
+    try:
+        own_meta = artifacts.read_meta(entry)
+    except (OSError, ValueError):
+        own_meta = None
+    if own_meta is not None:
+        return None
+    entries_root = settings.cache_dir / "entries"
+    if not entries_root.is_dir():
+        return None
+    for child in sorted(entries_root.iterdir()):
+        if child == entry or not child.is_dir():
+            continue
+        try:
+            meta = artifacts.read_meta(child)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(meta, dict) or meta.get("source") != resolved.source:
+            continue
+        older_key = meta.get("identity")
+        if older_key == resolved.key:
+            continue
+        older_kind = str(meta.get("kind") or "unknown")
+        older_name = str(older_key) if older_key else child.name
+        return (
+            f"the previous entry {older_name} ({older_kind}) for this source was "
+            f"not reused because the identity changed to {resolved.key} "
+            f"({resolved.kind}); a changed file sample or a different requested "
+            "identity mode are the reasons a key changes"
+        )
+    return None
+
+
+def _record_identity_note(report: _Report, note: str | None) -> None:
+    """Surface an identity-change note in the response's status block."""
+    if note is not None:
+        report.skipped["identity"] = note
 
 
 def _ensure_probe(entry: Path, path: Path, report: _Report) -> media.ProbeResult:
@@ -986,20 +1065,20 @@ def _ensure_transcript(
 
     A cached `transcript.json` is reused as-is. Otherwise the delegated
     pipeline runs once under the single-flight lock, with an `--out` inside
-    the entry so nothing lands in a working directory. The tier is reported
-    only from evidence: the pipeline's confirmed `meta["tier"]`/`meta["model"]`
-    (via `contracts.run_transcript`), never from the server's own assumption.
+    the entry so nothing lands in a working directory. The cache is consulted
+    again *after* the lock is taken: a caller that waited for a holder finds
+    the entry that holder just wrote and reports it as a cache hit instead of
+    decoding the same source a second time, and only then is the stale
+    `transcribe/` work directory wiped. The tier is reported only from
+    evidence: the pipeline's confirmed `meta["tier"]`/`meta["model"]` (via
+    `contracts.run_transcript`), never from the server's own assumption.
     """
     transcript_path = entry / "transcript.json"
-    data = _read_json(transcript_path)
-    if isinstance(data, dict) and isinstance(data.get("segments"), list):
+    cached = _cached_transcript(transcript_path)
+    if cached is not None:
         report.cached.append("transcript.json")
-        meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
-        tier = str(meta.get("tier") or meta.get("model") or "unknown")
-        return list(data["segments"]), dict(meta), {}, tier
+        return cached
 
-    tier, device_choice, rationale = _choose_tier(settings, model, device)
-    report.extras.append(f"tier: {tier} ({rationale})")
     note = acquire_transcribe_lock(
         settings,
         source=source,
@@ -1010,6 +1089,18 @@ def _ensure_transcript(
     if note is not None:
         report.capped.append(f"transcribe lock: {note}")
     try:
+        # A second identical call waits on the flock above; once it is handed
+        # the lock the holder's `transcript.json` is already in place, so it is
+        # reported as a cache hit rather than a second pipeline run (design
+        # section 12, "the second job runs after the first and then reuses the
+        # cache entry", and the stale-workdir wipe is skipped with it).
+        cached = _cached_transcript(transcript_path)
+        if cached is not None:
+            report.cached.append("transcript.json")
+            return cached
+
+        tier, device_choice, rationale = _choose_tier(settings, model, device)
+        report.extras.append(f"tier: {tier} ({rationale})")
         out_dir = entry / "transcribe"
         _empty_dir(out_dir)
         argv = contracts.build_argv(
@@ -1032,8 +1123,19 @@ def _ensure_transcript(
     meta["device"] = device_choice
     _write_json(transcript_path, {"meta": meta, "segments": result.segments})
     report.computed.append("transcript")
-    _record_entry(entry, artifacts.resolve_source(str(path)))
     return result.segments, meta, result.artifacts, result.tier
+
+
+def _cached_transcript(
+    transcript_path: Path,
+) -> tuple[list[dict[str, object]], dict[str, object], dict[str, Path], str] | None:
+    """Read a usable `transcript.json`, or `None` when there is nothing cached."""
+    data = _read_json(transcript_path)
+    if not isinstance(data, dict) or not isinstance(data.get("segments"), list):
+        return None
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    tier = str(meta.get("tier") or meta.get("model") or "unknown")
+    return list(data["segments"]), dict(meta), {}, tier
 
 
 def _empty_dir(path: Path) -> None:
@@ -1100,6 +1202,20 @@ def _requested_timestamps(
     if span is not None:
         return _window_timestamps(center, span, fps, duration, cap)
     return [center]
+
+
+def _require_video_stream(
+    path: Path, result: media.ProbeResult, consequence: str
+) -> None:
+    """Refuse frame work on a source whose probe found no video stream.
+
+    The design's edge case is explicit: an audio-only source makes the frame
+    and OCR tools return a clear "no video stream" error rather than an empty
+    result. The check runs on the probe that all frame paths already need, so
+    it holds whichever way `at` selects timestamps.
+    """
+    if not result.has_video:
+        raise MediaError(f"{path} has no video stream, so {consequence}")
 
 
 def _resolve_crop_box(
@@ -1206,11 +1322,168 @@ def _candidate_timestamps(
     budget: int,
     report: _Report,
 ) -> list[float]:
-    """Rank frame candidates and return their timestamps (for `at="scenes"`)."""
+    """Rank frame candidates and return their timestamps (for `at="scenes"`).
+
+    The candidate list stays complete in `scenes.json`; only the timestamps
+    handed to rasterization are bounded to what this source can actually
+    produce. A scene boundary or, more often, a silence boundary reported at
+    the probed duration is a real moment, but `-ss` cannot reach past the last
+    frame's presentation time (`duration - 1/fps`), so such a candidate would
+    fail extraction with an empty output. It is dropped here — and the drop is
+    stated in `skipped`, never silent — rather than merged away in the list.
+    """
     _scenes, candidates, _accounting = _ensure_scene_candidates(
         entry, path, result, threshold, budget, report
     )
-    return [candidate.timestamp for candidate in candidates]
+    last = result.duration - (1.0 / result.fps) if result.fps > 0 else result.duration
+    stamps = [
+        candidate.timestamp for candidate in candidates if candidate.timestamp <= last
+    ]
+    omitted = len(candidates) - len(stamps)
+    if omitted:
+        report.skipped["scenes"] = (
+            f"{omitted} candidate(s) at or beyond the last frame "
+            f"({_stamp(last)}) of a {_stamp(result.duration)} clip: omitted, "
+            "no frame exists to rasterize"
+        )
+    return stamps
+
+
+# ---------------------------------------------------------------------------
+# The timeline projection
+# ---------------------------------------------------------------------------
+
+
+def _number(value: object) -> float | None:
+    """Coerce a JSON value to a float, or `None` when it is not a number."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_dicts(value: object) -> list[dict[str, object]]:
+    """Return the object items of a JSON array, ignoring anything else."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _stored_list(path: Path) -> list[dict[str, object]]:
+    """Read a JSON array of objects from disk, or an empty list."""
+    return _as_dicts(_read_json(path))
+
+
+def _timeline_events(entry: Path) -> list[artifacts.TimelineEvent]:
+    """Project the entry's cached artifacts into timeline events.
+
+    One layer per stage: `scene` boundaries from `scenes.json`, `audio` events
+    from `audio_events.json`, `speech` from `transcript.json`, `ocr` strings
+    from the `ocr/` records, and the persisted value-tracking candidates from
+    `ocr_changes.json`. Reading the artifacts instead of accumulating events
+    in memory is what lets a later stage rebuild the whole file without
+    dropping what an earlier stage contributed. A malformed record is skipped
+    rather than crashing the tool: the projection is a convenience over the
+    artifacts, never their source of truth.
+    """
+    events: list[artifacts.TimelineEvent] = []
+
+    scenes = _read_json(entry / "scenes.json")
+    if isinstance(scenes, dict):
+        for item in _as_dicts(scenes.get("scenes")):
+            timestamp = _number(item.get("timestamp"))
+            if timestamp is not None:
+                score = _number(item.get("score")) or 0.0
+                events.append(
+                    artifacts.TimelineEvent(timestamp, "scene", f"score {score:.3f}")
+                )
+
+    for item in _stored_list(entry / "audio_events.json"):
+        timestamp = _number(item.get("timestamp"))
+        if timestamp is not None:
+            kind = str(item.get("kind") or "audio")
+            detail = str(item.get("detail") or "")
+            events.append(
+                artifacts.TimelineEvent(timestamp, "audio", f"{kind} {detail}".strip())
+            )
+
+    transcript = _read_json(entry / "transcript.json")
+    if isinstance(transcript, dict):
+        for item in _as_dicts(transcript.get("segments")):
+            timestamp = _number(item.get("start"))
+            if timestamp is not None:
+                speaker = str(item.get("speaker") or "(unknown)")
+                events.append(
+                    artifacts.TimelineEvent(
+                        timestamp,
+                        "speech",
+                        f"{speaker}: {item.get('text') or ''}",
+                    )
+                )
+
+    ocr_dir = entry / "ocr"
+    if ocr_dir.is_dir():
+        for record in sorted(ocr_dir.glob("*.json")):
+            item = _read_json(record)
+            if isinstance(item, dict):
+                timestamp = _number(item.get("timestamp"))
+                if timestamp is not None:
+                    text = str(item.get("text") or "").strip()
+                    events.append(
+                        artifacts.TimelineEvent(timestamp, "ocr", text or "(no text)")
+                    )
+
+    for item in _stored_list(entry / "ocr_changes.json"):
+        timestamp = _number(item.get("timestamp"))
+        if timestamp is not None:
+            events.append(
+                artifacts.TimelineEvent(timestamp, "ocr-change", _change_payload(item))
+            )
+
+    return events
+
+
+def _change_payload(item: dict[str, object]) -> str:
+    """Render one persisted value-tracking candidate as a short timeline payload."""
+    return (
+        f"value {item.get('value')}, neighbours {item.get('before')} "
+        f"then {item.get('after')}"
+    )
+
+
+def _refresh_timeline(entry: Path, report: _Report) -> None:
+    """Rewrite the entry's `timeline.md` as the projection of its artifacts."""
+    artifacts.write_timeline(entry, _timeline_events(entry))
+    report.computed.append("timeline")
+
+
+def _record_ocr_changes(entry: Path, candidates: list[media.ChangeCandidate]) -> None:
+    """Persist the value-tracking candidates beside the OCR records.
+
+    Keyed and merged by timestamp rather than replaced, so running OCR over a
+    second window appends to the record instead of erasing the first window's
+    candidates; the timeline can then be rebuilt at any later call without
+    losing them.
+    """
+    stored: dict[float, dict[str, object]] = {}
+    for item in _stored_list(entry / "ocr_changes.json"):
+        timestamp = _number(item.get("timestamp"))
+        if timestamp is not None:
+            stored[timestamp] = item
+    for candidate in candidates:
+        stored[candidate.timestamp] = {
+            "timestamp": candidate.timestamp,
+            "value": candidate.value,
+            "before": candidate.before,
+            "after": candidate.after,
+            "confidence": candidate.confidence,
+        }
+    _write_json(
+        entry / "ocr_changes.json",
+        [stored[stamp] for stamp in sorted(stored)],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1221,8 +1494,9 @@ def _candidate_timestamps(
 def _probe_work(
     settings: Settings, source: str, identity: str, cancel: threading.Event
 ) -> str:
-    resolved, path, entry = _entry_for(settings, source, identity)
+    resolved, path, entry, identity_note = _entry_for(settings, source, identity)
     report = _Report()
+    _record_identity_note(report, identity_note)
     result = _ensure_probe(entry, path, report)
     _record_entry(entry, resolved)
 
@@ -1236,10 +1510,17 @@ def _probe_work(
         f"Resolution: {result.width}x{result.height}",
         f"Duration: {_stamp(result.duration)} ({result.duration:.3f} s)",
         f"Frame rate: {result.fps:.3f} fps",
+        f"Container: {result.container or '(unknown)'}",
         f"Video codec: {result.video_codec or '(none)'}",
         f"Audio codec: {result.audio_codec or '(none)'}",
+        f"Audio layout: {result.audio_layout or '(none)'}",
         f"Streams: video={_yes_no(result.has_video)}, audio={_yes_no(result.has_audio)}",
-        f"Stream start_time: audio-video offset {offset:+.3f} s",
+        (
+            "Stream start_time: "
+            f"video={_stream_start(result.video_start_time)}, "
+            f"audio={_stream_start(result.audio_start_time)} "
+            f"(audio-video offset {offset:+.3f} s)"
+        ),
         f"Source size: {result.size_bytes} bytes",
     ]
     if abs(offset) > 0.5:
@@ -1289,8 +1570,9 @@ def _manifest_work(
         else SCENE_THRESHOLD_DEFAULT
     )
     budget = validate_count(frame_budget, FRAME_BUDGET_DEFAULT, COUNT_CAP)
-    resolved, path, entry = _entry_for(settings, source, identity)
+    resolved, path, entry, identity_note = _entry_for(settings, source, identity)
     report = _Report()
+    _record_identity_note(report, identity_note)
     result = _ensure_probe(entry, path, report)
     _record_entry(entry, resolved)
     scenes, candidates, accounting = _ensure_scene_candidates(
@@ -1427,6 +1709,8 @@ def _manifest_work(
         else:
             lines.append("No frames were selected for OCR.")
 
+    _refresh_timeline(entry, report)
+    _evict_after_job(settings, entry, report)
     lines += ["", report.status()]
     return "\n".join(lines)
 
@@ -1451,10 +1735,12 @@ def _frames_work(
     count_value = validate_count(count)
     fps_value = validate_fps(fps)
     crop_spec = validate_crop(crop)
-    resolved, path, entry = _entry_for(settings, source, identity)
+    resolved, path, entry, identity_note = _entry_for(settings, source, identity)
     report = _Report()
+    _record_identity_note(report, identity_note)
     result = _ensure_probe(entry, path, report)
     _record_entry(entry, resolved)
+    _require_video_stream(path, result, "no frame can be extracted")
     edge = int(max_edge) if max_edge is not None else settings.frame_max_edge
 
     if isinstance(at, str) and at.strip().lower() == "scenes":
@@ -1543,6 +1829,7 @@ def _frames_work(
             "No usable font was found for tile labels, so the images are "
             "returned unlabelled."
         )
+    _evict_after_job(settings, entry, report)
     lines += ["", report.status()]
     return "\n".join(lines)
 
@@ -1567,10 +1854,12 @@ def _ocr_work(
     crop_spec = validate_crop(crop)
     psm_value = validate_count(psm, 6, 13, name="psm")
     language = str(lang or "eng")
-    resolved, path, entry = _entry_for(settings, source, identity)
+    resolved, path, entry, identity_note = _entry_for(settings, source, identity)
     report = _Report()
+    _record_identity_note(report, identity_note)
     result = _ensure_probe(entry, path, report)
     _record_entry(entry, resolved)
+    _require_video_stream(path, result, "no frame can be extracted for OCR")
 
     if isinstance(at, str) and at.strip().lower() == "scenes":
         stamps = _candidate_timestamps(
@@ -1625,6 +1914,7 @@ def _ocr_work(
         )
     if track:
         candidates = media.track_values(results)
+        _record_ocr_changes(entry, candidates)
         lines += ["", "Value tracking candidates (candidate events, not conclusions):"]
         if candidates:
             for candidate in candidates:
@@ -1638,6 +1928,8 @@ def _ocr_work(
                 "No numeric value was found that disagrees with both neighbours, so "
                 "there is no candidate event in this window."
             )
+    _refresh_timeline(entry, report)
+    _evict_after_job(settings, entry, report)
     lines += ["", report.status()]
     return "\n".join(lines)
 
@@ -1654,8 +1946,9 @@ def _transcript_work(
     cancel: threading.Event,
 ) -> str:
     queue = validate_choice(queue, "wait", _QUEUE_MODES, "queue")
-    resolved, path, entry = _entry_for(settings, source, identity)
+    resolved, path, entry, identity_note = _entry_for(settings, source, identity)
     report = _Report()
+    _record_identity_note(report, identity_note)
     _ensure_probe(entry, path, report)
     _record_entry(entry, resolved)
     speakers = int(num_speakers) if num_speakers is not None else 0
@@ -1697,6 +1990,8 @@ def _transcript_work(
         lines += [f"- {key}: {value}" for key, value in sorted(artifacts_paths.items())]
     else:
         lines += ["", "Artifacts: (reused from cache)"]
+    _refresh_timeline(entry, report)
+    _evict_after_job(settings, entry, report)
     lines += ["", report.status()]
     return "\n".join(lines)
 
@@ -1712,8 +2007,9 @@ def _search_work(
 ) -> str:
     k_value = validate_k(k)
     scope = validate_choice(scope, "all", _SEARCH_SCOPES, "scope")
-    resolved, _path, entry = _entry_for(settings, source, identity)
+    resolved, _path, entry, identity_note = _entry_for(settings, source, identity)
     report = _Report()
+    _record_identity_note(report, identity_note)
     if not str(query).strip():
         raise MediaError("query must be a non-empty search string")
 
@@ -1876,7 +2172,7 @@ async def media_manifest(
 
 async def media_frames(
     source: str,
-    at: list | str | float | None = None,
+    at: list | str | float | None = "scenes",
     window: float | None = None,
     fps: int | None = None,
     count: int | None = None,
@@ -1907,7 +2203,7 @@ async def media_frames(
 
 async def media_ocr(
     source: str,
-    at: list | str | float | None = None,
+    at: list | str | float | None = "scenes",
     window: float | None = None,
     fps: int | None = None,
     count: int | None = None,
@@ -1997,17 +2293,20 @@ _TOOL_DESCRIPTIONS = {
         "a transcript."
     ),
     "media_frames": (
-        "Write PNG stills for the timestamps in `at` (a list, one timestamp, or "
-        "the literal 'scenes'), returning the absolute paths. `window` samples a "
-        "span around one timestamp at `fps`; `tile` chooses sheet (grid), "
-        "filmstrip (vertical stack), or individual (one file per timestamp). "
-        "Point the `read` tool at the returned paths to view them."
+        "Write PNG stills for the timestamps in `at`, returning the absolute "
+        "paths. `at` is a list of timestamps, one timestamp, or the literal "
+        "'scenes' (the default, which returns one contact sheet of the ranked "
+        "scene candidates). `window` samples a span around one timestamp at "
+        "`fps`; `tile` chooses sheet (grid), filmstrip (vertical stack), or "
+        "individual (one file per timestamp). Point the `read` tool at the "
+        "returned paths to view them."
     ),
     "media_ocr": (
         "Recognize on-screen text at the timestamps in `at` and return it per "
-        "timestamp. `crop` narrows the region before OCR, and `track=true` "
-        "reports numeric values that disagree with both neighbours as candidate "
-        "events. Use for slides, subtitles burned into video, and UI numbers."
+        "timestamp; `at` is a list, one timestamp, or 'scenes' (the default). "
+        "`crop` narrows the region before OCR, and `track=true` reports numeric "
+        "values that disagree with both neighbours as candidate events. Use for "
+        "slides, subtitles burned into video, and UI numbers."
     ),
     "media_transcript": (
         "Transcribe speech by delegating to the MEDIA_TRANSCRIBE_BIN pipeline, "

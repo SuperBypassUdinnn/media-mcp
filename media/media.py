@@ -206,6 +206,14 @@ class ProbeResult:
     stream starts later than the video, zero when there is only one stream or
     the two start together. Frame and scene tools correct positions with
     `av_offset_seconds`.
+
+    `container` is ffprobe's `format.format_name` verbatim (for example
+    `mov,mp4,m4a,3gp,3g2,mj2`), `video_start_time`/`audio_start_time` carry
+    each stream's own raw `start_time` and are `None` only when that stream is
+    absent, and `audio_layout` is the audio stream's `channel_layout` or the
+    fallback `<n> channels`, and `""` when there is no audio stream at all.
+    The raw start times are kept beside the derived offset so a reader never
+    has to guess one from the other.
     """
 
     duration: float
@@ -218,6 +226,10 @@ class ProbeResult:
     has_audio: bool
     audio_offset: float
     size_bytes: int
+    container: str = ""
+    video_start_time: float | None = None
+    audio_start_time: float | None = None
+    audio_layout: str = ""
 
 
 @dataclass(frozen=True)
@@ -1307,7 +1319,9 @@ def _probe_result_from_json(stdout: str) -> ProbeResult:
     raising. The duration prefers the format-level measure and falls back to
     the longest stream duration; widths and frame rates come from the first
     video stream, and the A/V offset is the audio stream's `start_time` minus
-    the video stream's.
+    the video stream's. The container name, each stream's raw `start_time`,
+    and the audio channel layout are kept too, because the probe response
+    promises them beside the offset.
     """
     try:
         data = json.loads(stdout)
@@ -1335,6 +1349,7 @@ def _probe_result_from_json(stdout: str) -> ProbeResult:
         duration = max(stream_durations, default=0.0)
 
     size_bytes = _as_int(fmt.get("size")) if isinstance(fmt, dict) else 0
+    container = str(fmt.get("format_name") or "") if isinstance(fmt, dict) else ""
 
     width = _as_int(video.get("width")) if has_video else 0
     height = _as_int(video.get("height")) if has_video else 0
@@ -1343,8 +1358,10 @@ def _probe_result_from_json(stdout: str) -> ProbeResult:
     else:
         fps = 0.0
 
-    video_offset = _as_float(video.get("start_time")) if has_video else 0.0
-    audio_offset_value = _as_float(audio.get("start_time")) if has_audio else 0.0
+    video_start = _as_float(video.get("start_time")) if has_video else None
+    audio_start = _as_float(audio.get("start_time")) if has_audio else None
+    video_offset = video_start if video_start is not None else 0.0
+    audio_offset_value = audio_start if audio_start is not None else 0.0
     if has_video and has_audio:
         audio_offset = audio_offset_value - video_offset
     else:
@@ -1361,7 +1378,30 @@ def _probe_result_from_json(stdout: str) -> ProbeResult:
         has_audio=has_audio,
         audio_offset=audio_offset,
         size_bytes=size_bytes,
+        container=container,
+        video_start_time=video_start,
+        audio_start_time=audio_start,
+        audio_layout=_audio_layout(audio),
     )
+
+
+def _audio_layout(stream: dict[str, object] | None) -> str:
+    """Return a stream's channel layout, its channel count, or `""`.
+
+    ffprobe's `channel_layout` is the honest answer and is used verbatim; when
+    a decoder omits it, the numeric `channels` is reported as
+    `<n> channels`; when there is no audio stream (or neither field is
+    usable) the answer is `""` rather than an invented layout name.
+    """
+    if stream is None:
+        return ""
+    layout = stream.get("channel_layout")
+    if isinstance(layout, str) and layout.strip():
+        return layout.strip()
+    channels = _as_int(stream.get("channels"))
+    if channels > 0:
+        return f"{channels} channels"
+    return ""
 
 
 def _codec(stream: dict[str, object] | None) -> str:

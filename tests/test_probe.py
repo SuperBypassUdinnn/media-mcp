@@ -100,6 +100,41 @@ def test_plain_sample_offset_is_near_zero(tmp_path):
     assert abs(media.av_offset_seconds(result)) < 0.3
 
 
+# Probe metadata: container, audio layout, and per-stream start_time (fix M4) ------
+
+
+def test_probe_reports_container_layout_and_stream_start_times(tmp_path):
+    result = media.probe(fixtures.make_sample(tmp_path / "meta.mp4", duration=4))
+    assert "mp4" in result.container
+    assert result.audio_layout == "mono"
+    assert isinstance(result.video_start_time, float)
+    assert isinstance(result.audio_start_time, float)
+    assert result.audio_offset == pytest.approx(
+        result.audio_start_time - result.video_start_time, abs=1e-6
+    )
+
+
+def test_probe_reports_the_raw_start_times_of_a_delayed_audio_stream(tmp_path):
+    result = media.probe(
+        fixtures.make_sample(tmp_path / "delayed.mp4", duration=4, audio_offset=1.0)
+    )
+    assert result.video_start_time is not None
+    assert result.audio_start_time is not None
+    raw_difference = result.audio_start_time - result.video_start_time
+    assert raw_difference == pytest.approx(1.0, abs=0.05)
+
+
+def test_audio_only_probe_has_no_video_start_time_and_still_reports_the_container(
+    tmp_path,
+):
+    result = media.probe(fixtures.make_audio_only(tmp_path / "a.m4a"))
+    assert result.video_start_time is None
+    assert result.audio_start_time is not None
+    assert result.container
+    assert result.audio_layout
+    assert result.audio_offset == 0.0
+
+
 def test_validate_source_returns_the_file_inside_roots(tmp_path):
     root = tmp_path / "roots"
     f = fixtures.make_sample(root / "in.mp4", duration=2)
