@@ -4,9 +4,11 @@
 # It mirrors the delegated contract without any transcription toolchain:
 # `--help` exits 0, an unknown flag is ignored rather than rejected, the
 # input's stem names one directory under `--out`, and four artifacts land
-# inside it. Two switches drive the failure paths:
+# inside it. Four switches drive the failure and timing paths:
 #   FAKE_TRANSCRIBE_FAIL=1     exit 3 with a clear stderr line
 #   FAKE_TRANSCRIBE_PARTIAL=1  write every artifact except the .md
+#   FAKE_TRANSCRIBE_PIDFILE=FILE  write this script's own pid to FILE
+#   FAKE_TRANSCRIBE_SLEEP=SECONDS sleep before doing any work
 set -eu
 
 usage() {
@@ -61,6 +63,14 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+if [ -n "${FAKE_TRANSCRIBE_PIDFILE:-}" ]; then
+    printf '%s\n' "$$" >"${FAKE_TRANSCRIBE_PIDFILE}"
+fi
+
+if [ -n "${FAKE_TRANSCRIBE_SLEEP:-}" ]; then
+    sleep "${FAKE_TRANSCRIBE_SLEEP}"
+fi
 
 if [ "${FAKE_TRANSCRIBE_FAIL:-0}" = "1" ]; then
     echo "fake transcribe: deliberate failure requested" >&2

@@ -63,6 +63,15 @@ MEDIA_MAX_SOURCE_SECONDS = 14400.0
 # The warning threshold: half of each hard cap (2 GiB, 2 hours).
 _WARN_FRACTION = 0.5
 
+# ffprobe's own deadline. Probe runs through the bounded runner like every
+# other child, so a hung ffprobe is stopped and its group taken down rather
+# than holding a tool call forever (finding R29: probe used to escape both).
+_PROBE_TIMEOUT_SECONDS = 300
+
+# nvidia-smi answers instantly when a driver is present and does not exist
+# otherwise; this bounds the rare wedged-driver case.
+_VRAM_QUERY_TIMEOUT_SECONDS = 30
+
 # String values ffprobe emits for numbers it could not measure.
 _NOT_A_NUMBER = frozenset({"N/A", "NA", "MISSING", "?", "-", ""})
 
@@ -318,11 +327,12 @@ def probe(path: Path) -> ProbeResult:
     """Run ffprobe on `path` and return its parsed `ProbeResult`.
 
     ffprobe runs as an argument list (`ffprobe -v error -print_format json
-    -show_format -show_streams`) with stderr captured. A missing file, a
-    directory, or any non-zero ffprobe exit raises `MediaError` naming the
-    path and ending with the exit code and the captured stderr; a wrong
-    extension or corrupt file is therefore a `MediaError`, never a traceback
-    from JSON parsing.
+    -show_format -show_streams`) through the bounded runner, so a hung probe
+    is stopped with its process group and never outlives the call; stderr is
+    captured. A missing file, a directory, or any non-zero ffprobe exit raises
+    `MediaError` naming the path and ending with the exit code and the captured
+    stderr; a wrong extension or corrupt file is therefore a `MediaError`,
+    never a traceback from JSON parsing.
     """
     path = Path(path)
     if not path.exists():
@@ -340,9 +350,9 @@ def probe(path: Path) -> ProbeResult:
         str(path),
     ]
     try:
-        done = subprocess.run(argv, check=False, capture_output=True, text=True)
-    except FileNotFoundError as err:
-        raise MediaError(f"ffprobe is not available on PATH for {path}") from err
+        done = run_child(argv, timeout_seconds=_PROBE_TIMEOUT_SECONDS)
+    except MediaError as err:
+        raise MediaError(f"ffprobe could not read {path}: {err}") from err
     if done.returncode != 0:
         stderr = done.stderr.strip()
         raise MediaError(
@@ -389,6 +399,35 @@ def source_limits(result: ProbeResult) -> dict[str, bool]:
         "warn": seconds_warn or bytes_warn,
         "refuse": seconds_refuse or bytes_refuse,
     }
+
+
+def free_vram_mib() -> int | None:
+    """Return the largest free VRAM in MiB the driver reports, or None.
+
+    `nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits` runs
+    through the bounded runner, so a wedged driver cannot hold a tool call up.
+    None means the measurement is unavailable and the caller must fall back
+    rather than guess: the binary is absent, it exited non-zero, the run was
+    stopped, or not one line parsed as an integer. With several GPUs the
+    largest free figure is the one a tier choice can trust.
+    """
+    argv = ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"]
+    try:
+        done = run_child(argv, timeout_seconds=_VRAM_QUERY_TIMEOUT_SECONDS)
+    except MediaError:
+        return None
+    if done.returncode != 0:
+        return None
+    values: list[int] = []
+    for line in done.stdout.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            values.append(int(text))
+        except ValueError:
+            continue
+    return max(values) if values else None
 
 
 def detect_scenes(path: Path, threshold: float = 10.0) -> list[SceneScore]:
@@ -823,6 +862,68 @@ def rank_candidates(
     return ranked, accounting
 
 
+# Live children, keyed by pid, so one shutdown can stop every one of them ------
+#
+# `run_child` registers each live process here and removes it again when it
+# exits, so a server that is going away can stop the process group of a call
+# still in flight: a gracefully exited MCP server leaves its children alive on
+# POSIX unless it takes them down itself, and a reparented ffmpeg or whisper
+# would otherwise outlive the request that started it. The lock guards only the
+# dictionary operations and is never held across a wait, so registering and
+# stopping can never deadlock against each other.
+_ACTIVE_CHILDREN: dict[int, subprocess.Popen] = {}
+_ACTIVE_LOCK = threading.Lock()
+
+
+def _register_active_child(process: subprocess.Popen) -> None:
+    """Record a live child so `terminate_active_children` can find it."""
+    with _ACTIVE_LOCK:
+        _ACTIVE_CHILDREN[process.pid] = process
+
+
+def _unregister_active_child(process: subprocess.Popen) -> None:
+    """Forget a child that has exited; a repeated call is harmless."""
+    with _ACTIVE_LOCK:
+        _ACTIVE_CHILDREN.pop(process.pid, None)
+
+
+def terminate_active_children(grace: float = 2.0) -> int:
+    """Stop every live child's process group; return how many it stopped.
+
+    SIGTERM goes to each live child's process group (the group every
+    `run_child` child leads, so a grandchild that inherited it dies too), then
+    each survivor gets `grace` seconds before SIGKILL; the direct child is
+    reaped so no zombie is left behind. This never raises: a process that is
+    already gone, a group that cannot be signalled, and an empty registry are
+    all normal, and the return value is the number of children that were still
+    live when the call began. `main` runs it in a `finally`, so stdin EOF,
+    SIGTERM and SIGINT all end with it.
+    """
+    with _ACTIVE_LOCK:
+        processes = list(_ACTIVE_CHILDREN.values())
+    stopped = 0
+    try:
+        live = [process for process in processes if process.poll() is None]
+        stopped = len(live)
+        for process in live:
+            _signal_group(process.pid, signal.SIGTERM)
+        deadline = time.monotonic() + max(0.0, grace)
+        for process in live:
+            while process.poll() is None and time.monotonic() < deadline:
+                time.sleep(_POLL_SECONDS)
+        for process in live:
+            if process.poll() is None:
+                _signal_group(process.pid, signal.SIGKILL)
+        for process in live:
+            try:
+                process.wait(timeout=_KILL_GRACE_SECONDS)
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+    except OSError:
+        pass
+    return stopped
+
+
 def run_child(
     argv: list[str],
     timeout_seconds: int = 900,
@@ -855,7 +956,9 @@ def run_child(
     tools print `Fontconfig` noise on stderr while succeeding, so only the
     exit code decides success. `MediaError` is raised for a stop (timeout or
     cancellation) and for a process that could not start at all — a missing
-    binary, naming the binary and the OS error.
+    error, naming the binary and the OS error. A live child is registered so
+    `terminate_active_children` can stop its group if the server goes away
+    while the call is in flight.
     """
     started = time.monotonic()
     try:
@@ -878,6 +981,29 @@ def run_child(
     except (OSError, ValueError) as err:
         raise MediaError(f"could not start {argv[0]}: {err}; argv: {argv}") from err
 
+    _register_active_child(process)
+    try:
+        return _collect_child(
+            process, argv, timeout_seconds, cancel, stdin_bytes, started
+        )
+    finally:
+        _unregister_active_child(process)
+
+
+def _collect_child(
+    process: subprocess.Popen[str],
+    argv: list[str],
+    timeout_seconds: int,
+    cancel: threading.Event | None,
+    stdin_bytes: bytes | None,
+    started: float,
+) -> CompletedProcess[str]:
+    """Drain, bound, and reap one already-started child.
+
+    The body of `run_child` after the process exists: the registry wrapper
+    lives there, and everything that waits on the child lives here, so the
+    process can never be forgotten while it is being drained or stopped.
+    """
     if stdin_bytes is None:
         stdout_stream, stderr_stream = process.stdout, process.stderr
     else:
