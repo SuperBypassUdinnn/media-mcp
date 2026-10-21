@@ -1,0 +1,13 @@
+faster-whisper>=1.0.0
+# DeepFilterNet enhances noisy recordings before transcription (opt-in --denoise)
+deepfilternet==0.5.6
+# av 15.x: last series accepting metadata_errors kwarg used by faster-whisper
+av==15.*
+# hub 0.33.x: last series accepting use_auth_token kwarg used by pyannote 3.x
+huggingface-hub==0.33.*
+pyannote.audio>=3.1,<4
+# torch 2.8.x: verified working pair for pyannote 3.x (torchaudio API
+# still present); weights_only default handled via TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD (see transcribe.py)
+torch==2.8.*
+torchaudio==2.8.*
+soundfile>=0.12.0
