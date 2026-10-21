@@ -14,30 +14,36 @@ from media import media
 
 # Exactly as the brief writes them ------------------------------------------------
 
+# A child no other process on this machine can be mistaken for. A bare
+# `sleep 30` is not unique: the user's `power-mode watch` helper runs its own
+# `sleep 30` loop, so `pgrep -f "sleep 30"` observes an unrelated process and
+# the process-group check below fails for a reason that has nothing to do with
+# the runner. The marker is regex-safe and appears only in this child.
+_CHILD = [sys.executable, "-c", "import time; time.sleep(30)  # media-exec-child"]
+_CHILD_PATTERN = "media-exec-child"
+
 
 def test_timeout_kills_the_process_group():
     with pytest.raises(media.MediaError) as err:
-        media.run_child(["sleep", "30"], timeout_seconds=1)
+        media.run_child(_CHILD, timeout_seconds=1)
     assert "timeout" in str(err.value).lower()
-    assert (
-        subprocess.run(
-            ["pgrep", "-f", "sleep 30"], check=False, capture_output=True
-        ).returncode
-        != 0
-    )
+    assert not _matching_processes()
 
 
 def test_cancel_event_kills_the_child():
     cancel = threading.Event()
     threading.Timer(0.5, cancel.set).start()
     with pytest.raises(media.MediaError):
-        media.run_child(["sleep", "30"], timeout_seconds=60, cancel=cancel)
-    assert (
-        subprocess.run(
-            ["pgrep", "-f", "sleep 30"], check=False, capture_output=True
-        ).returncode
-        != 0
+        media.run_child(_CHILD, timeout_seconds=60, cancel=cancel)
+    assert not _matching_processes()
+
+
+def _matching_processes() -> list[str]:
+    """Every live process whose command line carries this test's child marker."""
+    found = subprocess.run(
+        ["pgrep", "-f", _CHILD_PATTERN], check=False, capture_output=True, text=True
     )
+    return [line for line in found.stdout.split() if line]
 
 
 def test_stderr_is_captured_and_returned():
