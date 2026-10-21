@@ -46,7 +46,7 @@ import anyio
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from media import artifacts, contracts, media
+from media import artifacts, contracts, ingest, media
 from media.media import MediaError
 
 # The shared parameter ceilings of the design document. `count` and `fps` and
@@ -728,49 +728,81 @@ def _evict_after_job(settings: Settings, entry: Path, report: _Report) -> None:
         report.cached.append(f"evicted {len(evicted)}")
 
 
-def _resolve_target(
-    settings: Settings, source: str, identity: str
-) -> tuple[artifacts.Identity, Path]:
-    """Validate a `source` and resolve its cache identity.
+def _resolve_source(
+    settings: Settings, source: str, entry: Path, report: _Report
+) -> Path:
+    """Resolve one `source` to the readable local path every stage consumes.
 
-    Local paths go through `media.validate_source`, so the allowlist check and
-    the readable-file check happen before anything else touches the file. HTTP
-    and HTTPS sources are refused with an actionable message: downloading is a
-    later task's work, and the server must not pretend a URL was processed.
+    A local path keeps today's rules: `media.validate_source` runs the
+    allowlist and readable-file checks before anything else touches the file.
+    An http/https URL is downloaded into `entry`'s `media/` directory through
+    `media.ingest`, which applies the private-range guard and the byte and
+    duration caps; the download or cache hit is folded into `report`, so every
+    tool that takes a source states it in the same status block.
     """
-    identity = validate_choice(identity, "sampled", _IDENTITIES, "identity")
-    parsed = urlparse(source)
-    if parsed.scheme in ("http", "https"):
-        raise MediaError(
-            f"URL ingestion is not implemented in this build: {source}; pass an "
-            "absolute local path instead (URL download is a later task's work)"
+    if ingest.is_url(source):
+        ingested = ingest.ingest_url(
+            source,
+            entry,
+            max_bytes=settings.max_source_bytes,
+            max_seconds=int(settings.max_source_seconds),
+            allow_private=settings.allow_private_urls,
+            timeout_seconds=settings.call_timeout_seconds,
         )
+        _record_ingest(report, ingested)
+        return ingested.path
+    parsed = urlparse(source)
     if parsed.scheme and len(parsed.scheme) > 1:
         raise MediaError(
             f"unsupported source scheme {parsed.scheme!r} in {source!r}: only "
             "local paths and http/https URLs are accepted"
         )
-    path = media.validate_source(source, settings.allowed_read_roots)
+    return media.validate_source(source, settings.allowed_read_roots)
+
+
+def _identity_for(source: str, identity: str) -> artifacts.Identity:
+    """Resolve a source to its content identity, converting failures."""
     try:
-        resolved = artifacts.resolve_source(str(path), identity)
+        return artifacts.resolve_source(source, identity)
     except (FileNotFoundError, ValueError) as err:
-        raise MediaError(f"could not identify source {path}: {err}") from err
-    return resolved, path
+        raise MediaError(f"could not identify source {source}: {err}") from err
+
+
+def _record_ingest(report: _Report, ingested: ingest.IngestedSource) -> None:
+    """State the URL download, or the cache hit that replaced it.
+
+    A first download is work this call computed and names the new
+    `media/<file>`; a reused one is a cache hit under the same name. When the
+    child left stderr behind, its last line travels with the download, so a
+    yt-dlp warning is visible without a second run.
+    """
+    name = f"media/{ingested.path.name}"
+    if ingested.from_cache:
+        report.cached.append(name)
+        return
+    note = f"download {name} ({ingested.bytes} bytes)"
+    tail = ingested.stderr_tail.splitlines()
+    if tail:
+        note += f"; yt-dlp stderr: {tail[-1]}"
+    report.computed.append(note)
 
 
 def _entry_for(
-    settings: Settings, source: str, identity: str
+    settings: Settings, source: str, identity: str, report: _Report
 ) -> tuple[artifacts.Identity, Path, Path, str | None]:
-    """Resolve a source to its identity, validated path, and cache entry.
+    """Resolve a source to its identity, local path, and cache entry.
 
     The fourth value is a note stating that an older entry for the same source
     with a different key was not reused, and why. Design section 12 requires
     that sentence whenever a source resolves to a new entry, so the detection
     lives here, at the one place every entry resolution passes through, and
-    every tool body surfaces the note in its status block.
+    every tool body surfaces the note in its status block. `report` receives the
+    URL download (or cache hit) as `_resolve_source` resolves it.
     """
-    resolved, path = _resolve_target(settings, source, identity)
+    identity = validate_choice(identity, "sampled", _IDENTITIES, "identity")
+    resolved = _identity_for(source, identity)
     entry = artifacts.entry_dir(resolved, settings.cache_dir)
+    path = _resolve_source(settings, source, entry, report)
     return resolved, path, entry, _previous_entry_note(settings, entry, resolved)
 
 
@@ -1494,8 +1526,10 @@ def _record_ocr_changes(entry: Path, candidates: list[media.ChangeCandidate]) ->
 def _probe_work(
     settings: Settings, source: str, identity: str, cancel: threading.Event
 ) -> str:
-    resolved, path, entry, identity_note = _entry_for(settings, source, identity)
     report = _Report()
+    resolved, path, entry, identity_note = _entry_for(
+        settings, source, identity, report
+    )
     _record_identity_note(report, identity_note)
     result = _ensure_probe(entry, path, report)
     _record_entry(entry, resolved)
@@ -1570,8 +1604,10 @@ def _manifest_work(
         else SCENE_THRESHOLD_DEFAULT
     )
     budget = validate_count(frame_budget, FRAME_BUDGET_DEFAULT, COUNT_CAP)
-    resolved, path, entry, identity_note = _entry_for(settings, source, identity)
     report = _Report()
+    resolved, path, entry, identity_note = _entry_for(
+        settings, source, identity, report
+    )
     _record_identity_note(report, identity_note)
     result = _ensure_probe(entry, path, report)
     _record_entry(entry, resolved)
@@ -1735,8 +1771,10 @@ def _frames_work(
     count_value = validate_count(count)
     fps_value = validate_fps(fps)
     crop_spec = validate_crop(crop)
-    resolved, path, entry, identity_note = _entry_for(settings, source, identity)
     report = _Report()
+    resolved, path, entry, identity_note = _entry_for(
+        settings, source, identity, report
+    )
     _record_identity_note(report, identity_note)
     result = _ensure_probe(entry, path, report)
     _record_entry(entry, resolved)
@@ -1854,8 +1892,10 @@ def _ocr_work(
     crop_spec = validate_crop(crop)
     psm_value = validate_count(psm, 6, 13, name="psm")
     language = str(lang or "eng")
-    resolved, path, entry, identity_note = _entry_for(settings, source, identity)
     report = _Report()
+    resolved, path, entry, identity_note = _entry_for(
+        settings, source, identity, report
+    )
     _record_identity_note(report, identity_note)
     result = _ensure_probe(entry, path, report)
     _record_entry(entry, resolved)
@@ -1946,8 +1986,10 @@ def _transcript_work(
     cancel: threading.Event,
 ) -> str:
     queue = validate_choice(queue, "wait", _QUEUE_MODES, "queue")
-    resolved, path, entry, identity_note = _entry_for(settings, source, identity)
     report = _Report()
+    resolved, path, entry, identity_note = _entry_for(
+        settings, source, identity, report
+    )
     _record_identity_note(report, identity_note)
     _ensure_probe(entry, path, report)
     _record_entry(entry, resolved)
@@ -2007,8 +2049,10 @@ def _search_work(
 ) -> str:
     k_value = validate_k(k)
     scope = validate_choice(scope, "all", _SEARCH_SCOPES, "scope")
-    resolved, _path, entry, identity_note = _entry_for(settings, source, identity)
     report = _Report()
+    resolved, _path, entry, identity_note = _entry_for(
+        settings, source, identity, report
+    )
     _record_identity_note(report, identity_note)
     if not str(query).strip():
         raise MediaError("query must be a non-empty search string")
@@ -2143,7 +2187,7 @@ def _cache_work(settings: Settings, action: str, cancel: threading.Event) -> str
 
 
 async def media_probe(source: str, identity: str = "sampled") -> str:
-    """Measure a local media source and cache the probe."""
+    """Measure a media source, local path or http/https URL, and cache the probe."""
     return await _guarded(
         lambda cancel: _probe_work(load_settings(), source, identity, cancel)
     )
@@ -2279,13 +2323,15 @@ async def media_cache(action: str = "list") -> str:
 
 _TOOL_DESCRIPTIONS = {
     "media_probe": (
-        "Measure a local media source without decoding it: resolution, duration, "
+        "Measure a media source (a local path or an http/https URL, downloaded "
+        "into the cache with yt-dlp) without decoding it: resolution, duration, "
         "fps, codecs, stream presence, the audio-video start_time offset, and the "
         "estimated cost of each later stage. Caches probe.json in the source's "
         "entry. Use this first to learn what the source contains."
     ),
     "media_manifest": (
-        "Assemble a Markdown digest of a local media source from cached "
+        "Assemble a Markdown digest of a media source (a local path or an "
+        "http/https URL) from cached "
         "artifacts: scene events, audio events, the audio-video offset, and a "
         "status block. `profile` presets the work: manifest (probe+scenes+audio, "
         "default), read (+transcript), visual (+OCR on selected frames), full "

@@ -753,12 +753,16 @@ def test_a_missing_source_is_an_actionable_error(server_session, tmp_path):
     assert "gone.mp4" in result.text
 
 
-def test_a_url_source_says_url_ingestion_is_not_implemented(server_session):
+def test_a_url_source_that_resolves_to_loopback_is_refused(server_session):
+    # The default for MEDIA_ALLOW_PRIVATE_URLS is off, so a numeric loopback
+    # host is refused before any child runs; the message names the address and
+    # the switch that would permit it.
     result = server_session.call(
-        "media_probe", {"source": "https://example.invalid/clip.mp4"}
+        "media_probe", {"source": "http://127.0.0.1:9/clip.mp4"}
     )
     assert result.is_error
-    assert "url" in result.text.lower()
+    assert "127.0.0.1" in result.text
+    assert "MEDIA_ALLOW_PRIVATE_URLS" in result.text
 
 
 # Helpers --------------------------------------------------------------------------
