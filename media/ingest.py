@@ -23,7 +23,8 @@ redirects, so a DNS-rebinding answer or a redirect to a private address is not
 blocked a second time; `MEDIA_ALLOW_PRIVATE_URLS` is the documented override and
 this is a single-user workstation tool. `--max-filesize` is a hint to `yt-dlp`
 and does not always abort a direct download early; the measured post-download
-check is the enforcement, so up to the cap may land before it is deleted.
+check is the enforcement, so a direct download can run past the cap before that
+check deletes it.
 """
 
 from __future__ import annotations
@@ -105,7 +106,7 @@ def ingest_url(
     and an over-cap cache hit is refused by name and left in place.
     """
     media_dir = Path(entry) / MEDIA_DIR_NAME
-    cached = _completed_file(media_dir)
+    cached = cached_download(entry)
     if cached is not None:
         size = cached.stat().st_size
         if size > max_bytes:
@@ -172,6 +173,15 @@ def ingest_url(
     if seconds > max_seconds:
         _refuse_seconds(source, produced, seconds, max_seconds)
     return IngestedSource(produced, size, False, tail)
+
+
+def cached_download(entry: Path) -> Path | None:
+    """The completed download already under `entry`, or `None`.
+
+    A pure read: it creates nothing and touches no network, so a caller can ask
+    whether a URL is already cached before it guards or resolves anything.
+    """
+    return _completed_file(Path(entry) / MEDIA_DIR_NAME)
 
 
 def _completed_files(media_dir: Path) -> list[Path]:
@@ -267,7 +277,7 @@ def _probe_seconds(source: str, path: Path, *, cached: bool = False) -> float:
                 f"the file was deleted from {path.parent}"
             ) from err
         raise MediaError(
-            f"{source}: the {what} file {path} cannot be probed ({err}); "
+            f"{source}: the {what} file {path.name} cannot be probed ({err}); "
             "the cached file was left in place"
         ) from err
 

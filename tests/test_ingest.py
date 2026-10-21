@@ -458,6 +458,51 @@ def test_an_unresolvable_host_is_a_media_error(tmp_path) -> None:
     assert "cannot resolve the host" in str(refused.value)
 
 
+def test_a_cached_file_that_cannot_be_probed_is_left_in_place(
+    served, shim, tmp_path, monkeypatch
+) -> None:
+    """The third cache-hit refusal: unprobeable, named, and not deleted."""
+    _clip, url = served
+    entry = tmp_path / "entry"
+    broken = entry / "media" / "clip.mp4"
+    broken.parent.mkdir(parents=True)
+    broken.write_bytes(b"not a video" * 1024)
+
+    with pytest.raises(media.MediaError) as refused:
+        ingest.ingest_url(
+            url,
+            entry,
+            max_bytes=_ROOMY_BYTES,
+            max_seconds=_ROOMY_SECONDS,
+            allow_private=True,
+            timeout_seconds=_TIMEOUT,
+        )
+
+    message = str(refused.value)
+    assert "cached file" in message
+    assert "cannot be probed" in message
+    assert broken.is_file(), "a cache hit must not delete the file it found"
+
+
+def test_reuse_of_several_completed_files_is_deterministic(tmp_path) -> None:
+    """Pre-existing several-file state picks largest-then-name, and reads nothing."""
+    entry = tmp_path / "entry"
+    media_dir = entry / "media"
+    media_dir.mkdir(parents=True)
+    (media_dir / "a-small.mp4").write_bytes(b"1" * 10)
+    large = media_dir / "b-large.mp4"
+    large.write_bytes(b"2" * 30)
+    tie = media_dir / "c-tie.mp4"
+    tie.write_bytes(b"3" * 10)
+    (media_dir / "d-partial.mp4.part").write_bytes(b"4" * 99)
+
+    assert ingest.cached_download(entry) == large, "the largest file wins"
+    assert ingest.cached_download(tmp_path / "absent") is None
+
+    large.write_bytes(b"2" * 10)
+    assert ingest.cached_download(entry) == tie, "a size tie goes to the last name"
+
+
 def _duration_line(text: str) -> str:
     """The one response line that states the probed duration."""
     lines = [line for line in text.splitlines() if line.startswith("Duration: ")]

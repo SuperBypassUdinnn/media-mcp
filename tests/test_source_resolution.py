@@ -13,6 +13,8 @@ created.
 from __future__ import annotations
 
 import os
+import shutil
+import threading
 from pathlib import Path
 
 import pytest
@@ -129,3 +131,39 @@ def test_a_fractional_duration_cap_reaches_ingest_untruncated(
 
     assert seen["max_seconds"] == 0.5
     assert path == entry / "media" / "clip.mp4"
+
+
+def test_a_cached_url_hit_needs_no_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A promise of the cache: a hit is served from disk when DNS is not there.
+
+    The private-range guard resolves the host, so running it before the cache
+    check would turn an offline workstation's valid hit into an error.
+    """
+    settings = _settings(tmp_path, monkeypatch)
+    url = "http://no-such-host-9c1f2a.invalid/clip.mp4"
+    clip = fixtures.make_sample(tmp_path / "clip.mp4", duration=2)
+    resolved = artifacts.resolve_source(url, "sampled")
+    cached = artifacts.entry_path(resolved, settings.cache_dir) / "media" / "clip.mp4"
+    cached.parent.mkdir(parents=True)
+    shutil.copyfile(clip, cached)
+    report = server._Report()
+
+    got, path, _entry, _note = server._entry_for(settings, url, "sampled", report)
+
+    assert got.key == resolved.key
+    assert path == cached
+    assert report.cached == ["media/clip.mp4"], "a hit is reported as a cache hit"
+    assert report.computed == []
+
+
+def test_a_fractional_cap_is_rendered_as_a_fraction_in_the_probe_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch, MEDIA_MAX_SOURCE_SECONDS="0.5")
+    clip = fixtures.make_sample(tmp_path / "clip.mp4", duration=4)
+
+    text = server._probe_work(settings, str(clip), "sampled", threading.Event())
+
+    assert "0.5 s cap" in text, "the cap must be shown as configured, not rounded to 0"

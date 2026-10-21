@@ -800,20 +800,25 @@ def _entry_for(
 
     Order matters here, and tests assert it: a local path is validated (scheme
     refusal, allowlist, readability) *before* it is identified, so a refused
-    path is never opened and never creates a cache entry; an http/https URL is
-    guarded against private targets *before* its entry directory exists, then
-    identified by the URL itself. The fourth value is a note stating that an
-    older entry for the same source with a different key was not reused, and
-    why. Design section 12 requires that sentence whenever a source resolves to
-    a new entry, so the detection lives here, at the one place every entry
-    resolution passes through, and every tool body surfaces the note in its
-    status block. `report` receives the URL download (or cache hit).
+    path is never opened and never creates a cache entry; an http/https URL that
+    is *not* already cached is guarded against private targets *before* its
+    entry directory exists, while a URL that already holds a completed download
+    is served without any network access (not even a DNS lookup), which is the
+    cache promise a hit makes. A URL's identity is the URL itself. The fourth
+    value is a note stating that an older entry for the same source with a
+    different key was not reused, and why. Design section 12 requires that
+    sentence whenever a source resolves to a new entry, so the detection lives
+    here, at the one place every entry resolution passes through, and every tool
+    body surfaces the note in its status block. `report` receives the URL
+    download (or cache hit).
     """
     identity = validate_choice(identity, "sampled", _IDENTITIES, "identity")
     if ingest.is_url(source):
-        ingest.check_target_allowed(source, settings.allow_private_urls)
         resolved = _identity_for(source, identity)
-        entry = artifacts.entry_dir(resolved, settings.cache_dir)
+        entry = artifacts.entry_path(resolved, settings.cache_dir)
+        if ingest.cached_download(entry) is None:
+            ingest.check_target_allowed(source, settings.allow_private_urls)
+            entry = artifacts.entry_dir(resolved, settings.cache_dir)
         path = _download_source(settings, source, entry, report)
     else:
         path = _local_source_path(settings, source)
@@ -1586,7 +1591,7 @@ def _probe_work(
     if result.duration > settings.max_source_seconds:
         lines.append(
             f"WARNING: the source duration {result.duration:.3f} s exceeds the "
-            f"{settings.max_source_seconds:.0f} s cap."
+            f"{settings.max_source_seconds:g} s cap."
         )
     lines += [
         "",

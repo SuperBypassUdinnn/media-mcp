@@ -69,9 +69,18 @@ def resolve_source(source: str, identity: str = "sampled") -> Identity:
     return _resolve_file_sampled(source, path)
 
 
+def entry_path(identity: Identity, cache_root: Path) -> Path:
+    """Return the cache entry directory for `identity` without creating it.
+
+    Resolving a source must not create state: a caller checks for a cached
+    download through this path and only then decides whether it has to write.
+    """
+    return Path(cache_root) / "entries" / identity.key
+
+
 def entry_dir(identity: Identity, cache_root: Path) -> Path:
     """Return the cache entry directory for `identity`, creating it if missing."""
-    entry = Path(cache_root) / "entries" / identity.key
+    entry = entry_path(identity, cache_root)
     entry.mkdir(parents=True, exist_ok=True)
     return entry
 
