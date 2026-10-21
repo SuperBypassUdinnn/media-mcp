@@ -17,6 +17,7 @@ import functools
 import http.server
 import os
 import shutil
+import socket
 import threading
 from pathlib import Path
 
@@ -351,6 +352,110 @@ def test_probe_takes_a_url_source_over_stdio_and_reports_the_file_duration(
         assert session.invocations() == 1
     finally:
         session.close()
+
+
+def test_a_cache_hit_refusal_leaves_the_cached_file_in_place(
+    served, shim, tmp_path, monkeypatch
+) -> None:
+    """A hit refuses what it found; it never deletes a file it did not write."""
+    clip, url = served
+    entry = tmp_path / "entry"
+    monkeypatch.setenv("FAKE_YTDLP_SOURCE", str(clip))
+    first = ingest.ingest_url(
+        url,
+        entry,
+        max_bytes=_ROOMY_BYTES,
+        max_seconds=_ROOMY_SECONDS,
+        allow_private=True,
+        timeout_seconds=_TIMEOUT,
+    )
+    assert first.from_cache is False
+
+    with pytest.raises(media.MediaError) as too_big:
+        ingest.ingest_url(
+            url,
+            entry,
+            max_bytes=first.bytes - 1,
+            max_seconds=_ROOMY_SECONDS,
+            allow_private=True,
+            timeout_seconds=_TIMEOUT,
+        )
+    size_message = str(too_big.value)
+    assert "cached file" in size_message
+    assert "downloaded file" not in size_message
+    assert _downloaded(entry) == [first.path], "a hit must leave the file alone"
+
+    with pytest.raises(media.MediaError) as too_long:
+        ingest.ingest_url(
+            url,
+            entry,
+            max_bytes=_ROOMY_BYTES,
+            max_seconds=0.5,
+            allow_private=True,
+            timeout_seconds=_TIMEOUT,
+        )
+    assert "cached file" in str(too_long.value)
+    assert _downloaded(entry) == [first.path]
+
+
+def test_a_download_that_leaves_several_files_is_refused(
+    served, shim, tmp_path, monkeypatch
+) -> None:
+    """Exit 0 with a split video/audio pair is an ambiguous download, not a cache entry."""
+    clip, url = served
+    entry = tmp_path / "entry"
+    extra = tmp_path / "sample.f140.m4a"
+    extra.write_bytes(b"\0" * (clip.stat().st_size + 4096))
+    monkeypatch.setenv("FAKE_YTDLP_SOURCE", str(clip))
+    monkeypatch.setenv("FAKE_YTDLP_EXTRA", str(extra))
+
+    with pytest.raises(media.MediaError) as refused:
+        ingest.ingest_url(
+            url,
+            entry,
+            max_bytes=_ROOMY_BYTES,
+            max_seconds=_ROOMY_SECONDS,
+            allow_private=True,
+            timeout_seconds=_TIMEOUT,
+        )
+    message = str(refused.value)
+    assert "2 files" in message
+    assert "sample.mp4" in message and "sample.f140.m4a" in message
+    assert _downloaded(entry) == [], "an ambiguous download is deleted, not cached"
+
+
+def test_a_url_without_a_host_names_the_missing_host(tmp_path) -> None:
+    with pytest.raises(media.MediaError) as refused:
+        ingest.ingest_url(
+            "http:///clip.mp4",
+            tmp_path / "entry",
+            max_bytes=_ROOMY_BYTES,
+            max_seconds=_ROOMY_SECONDS,
+            allow_private=False,
+            timeout_seconds=_TIMEOUT,
+        )
+    assert "names no host" in str(refused.value)
+
+
+def test_an_unresolvable_host_is_a_media_error(tmp_path) -> None:
+    host = "no-such-host-3fa9c2b1.invalid"
+    try:
+        socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        pass
+    else:
+        pytest.skip("this resolver answers for reserved .invalid names")
+
+    with pytest.raises(media.MediaError) as refused:
+        ingest.ingest_url(
+            f"http://{host}/clip.mp4",
+            tmp_path / "entry",
+            max_bytes=_ROOMY_BYTES,
+            max_seconds=_ROOMY_SECONDS,
+            allow_private=False,
+            timeout_seconds=_TIMEOUT,
+        )
+    assert "cannot resolve the host" in str(refused.value)
 
 
 def _duration_line(text: str) -> str:

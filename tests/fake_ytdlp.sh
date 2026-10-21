@@ -10,6 +10,8 @@
 #
 # Switches:
 #   FAKE_YTDLP_SOURCE=FILE       the file copied to the -o target (required)
+#   FAKE_YTDLP_EXTRA=FILE        an extra file copied beside the target, to
+#                                simulate a run that leaves several files
 #   FAKE_YTDLP_MARKFILE=FILE     append one line per run, before doing any work
 #   FAKE_YTDLP_FAIL=1            write FAKE_YTDLP_STDERR to stderr, exit 7
 #   FAKE_YTDLP_STDERR=TEXT       the stderr text of that failure, verbatim
@@ -72,4 +74,7 @@ target=$(printf '%s' "$target" |
 
 mkdir -p "$(dirname "$target")"
 cp "$source_file" "$target"
+if [ -n "${FAKE_YTDLP_EXTRA:-}" ] && [ -f "${FAKE_YTDLP_EXTRA}" ]; then
+    cp "${FAKE_YTDLP_EXTRA}" "$(dirname "$target")/$(basename "${FAKE_YTDLP_EXTRA}")"
+fi
 echo "fake yt-dlp: wrote $target" >&2

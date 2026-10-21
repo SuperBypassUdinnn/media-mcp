@@ -728,29 +728,13 @@ def _evict_after_job(settings: Settings, entry: Path, report: _Report) -> None:
         report.cached.append(f"evicted {len(evicted)}")
 
 
-def _resolve_source(
-    settings: Settings, source: str, entry: Path, report: _Report
-) -> Path:
-    """Resolve one `source` to the readable local path every stage consumes.
+def _local_source_path(settings: Settings, source: str) -> Path:
+    """Validate a local `source` and return the path every later stage reads.
 
-    A local path keeps today's rules: `media.validate_source` runs the
-    allowlist and readable-file checks before anything else touches the file.
-    An http/https URL is downloaded into `entry`'s `media/` directory through
-    `media.ingest`, which applies the private-range guard and the byte and
-    duration caps; the download or cache hit is folded into `report`, so every
-    tool that takes a source states it in the same status block.
+    The scheme refusal, the `MEDIA_ALLOWED_READ_ROOTS` allowlist and the
+    readable-file check all run here, before anything identifies, opens or
+    hashes the file.
     """
-    if ingest.is_url(source):
-        ingested = ingest.ingest_url(
-            source,
-            entry,
-            max_bytes=settings.max_source_bytes,
-            max_seconds=int(settings.max_source_seconds),
-            allow_private=settings.allow_private_urls,
-            timeout_seconds=settings.call_timeout_seconds,
-        )
-        _record_ingest(report, ingested)
-        return ingested.path
     parsed = urlparse(source)
     if parsed.scheme and len(parsed.scheme) > 1:
         raise MediaError(
@@ -758,6 +742,28 @@ def _resolve_source(
             "local paths and http/https URLs are accepted"
         )
     return media.validate_source(source, settings.allowed_read_roots)
+
+
+def _download_source(
+    settings: Settings, source: str, entry: Path, report: _Report
+) -> Path:
+    """Download an http/https `source` into `entry`'s `media/` directory.
+
+    `media.ingest` applies the private-range guard (again, after the caller's
+    pre-flight check) and the byte and duration caps; the download or cache hit
+    is folded into `report`, so every tool that takes a source states it in the
+    same status block.
+    """
+    ingested = ingest.ingest_url(
+        source,
+        entry,
+        max_bytes=settings.max_source_bytes,
+        max_seconds=settings.max_source_seconds,
+        allow_private=settings.allow_private_urls,
+        timeout_seconds=settings.call_timeout_seconds,
+    )
+    _record_ingest(report, ingested)
+    return ingested.path
 
 
 def _identity_for(source: str, identity: str) -> artifacts.Identity:
@@ -792,17 +798,27 @@ def _entry_for(
 ) -> tuple[artifacts.Identity, Path, Path, str | None]:
     """Resolve a source to its identity, local path, and cache entry.
 
-    The fourth value is a note stating that an older entry for the same source
-    with a different key was not reused, and why. Design section 12 requires
-    that sentence whenever a source resolves to a new entry, so the detection
-    lives here, at the one place every entry resolution passes through, and
-    every tool body surfaces the note in its status block. `report` receives the
-    URL download (or cache hit) as `_resolve_source` resolves it.
+    Order matters here, and tests assert it: a local path is validated (scheme
+    refusal, allowlist, readability) *before* it is identified, so a refused
+    path is never opened and never creates a cache entry; an http/https URL is
+    guarded against private targets *before* its entry directory exists, then
+    identified by the URL itself. The fourth value is a note stating that an
+    older entry for the same source with a different key was not reused, and
+    why. Design section 12 requires that sentence whenever a source resolves to
+    a new entry, so the detection lives here, at the one place every entry
+    resolution passes through, and every tool body surfaces the note in its
+    status block. `report` receives the URL download (or cache hit).
     """
     identity = validate_choice(identity, "sampled", _IDENTITIES, "identity")
-    resolved = _identity_for(source, identity)
-    entry = artifacts.entry_dir(resolved, settings.cache_dir)
-    path = _resolve_source(settings, source, entry, report)
+    if ingest.is_url(source):
+        ingest.check_target_allowed(source, settings.allow_private_urls)
+        resolved = _identity_for(source, identity)
+        entry = artifacts.entry_dir(resolved, settings.cache_dir)
+        path = _download_source(settings, source, entry, report)
+    else:
+        path = _local_source_path(settings, source)
+        resolved = _identity_for(str(path), identity)
+        entry = artifacts.entry_dir(resolved, settings.cache_dir)
     return resolved, path, entry, _previous_entry_note(settings, entry, resolved)
 
 

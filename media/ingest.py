@@ -9,10 +9,21 @@ it is handed and never modifies a source.
 
 A completed file already under `<entry>/media/` is reused before any network
 access, so a cache hit runs no download at all; it is still measured and probed,
-because a lowered cap must not silently accept an over-cap file. A download
-reaches the private-range guard first, then `yt-dlp` with an argument list. Any
-refusal or failure deletes what the attempt wrote, so the cache never keeps a
-partial or over-cap download.
+because a lowered cap must not silently accept an over-cap file. A refusal on a
+cache hit names the cached file and leaves it in place: the attempt wrote
+nothing, and deleting a valid cache entry would only force the same download
+again. A download reaches the private-range guard first, then `yt-dlp` with an
+argument list; a refusal or failure on the download path deletes what the
+attempt wrote, and a run that exits 0 while leaving several files is refused
+rather than cached.
+
+Two limits are deliberate and documented rather than enforced. The guard is
+pre-flight: it resolves the host once, and `yt-dlp` resolves again and follows
+redirects, so a DNS-rebinding answer or a redirect to a private address is not
+blocked a second time; `MEDIA_ALLOW_PRIVATE_URLS` is the documented override and
+this is a single-user workstation tool. `--max-filesize` is a hint to `yt-dlp`
+and does not always abort a direct download early; the measured post-download
+check is the enforcement, so up to the cap may land before it is deleted.
 """
 
 from __future__ import annotations
@@ -80,7 +91,7 @@ def ingest_url(
     entry: Path,
     *,
     max_bytes: int,
-    max_seconds: int,
+    max_seconds: float,
     allow_private: bool,
     timeout_seconds: int,
 ) -> IngestedSource:
@@ -89,21 +100,22 @@ def ingest_url(
     Raises `MediaError` naming the measured value and the cap when the result
     is over either limit, naming the host and `MEDIA_ALLOW_PRIVATE_URLS` when a
     private target is refused, and carrying yt-dlp's exit code and final stderr
-    lines verbatim when the child fails. Every refusal and failure deletes the
-    download this call produced; a cache hit touches nothing.
+    lines verbatim when the child fails. Every refusal and failure on the
+    download path deletes what this call produced; a cache hit runs no download,
+    and an over-cap cache hit is refused by name and left in place.
     """
     media_dir = Path(entry) / MEDIA_DIR_NAME
     cached = _completed_file(media_dir)
     if cached is not None:
         size = cached.stat().st_size
         if size > max_bytes:
-            _refuse_size(source, cached, size, max_bytes)
-        seconds = _probe_seconds(source, cached)
+            _refuse_size(source, cached, size, max_bytes, cached=True)
+        seconds = _probe_seconds(source, cached, cached=True)
         if seconds > max_seconds:
-            _refuse_seconds(source, cached, seconds, max_seconds)
+            _refuse_seconds(source, cached, seconds, max_seconds, cached=True)
         return IngestedSource(cached, size, True, "")
 
-    _refuse_private_host(source, allow_private)
+    check_target_allowed(source, allow_private)
     media_dir.mkdir(parents=True, exist_ok=True)
     for stale in media_dir.glob(f"*{_PART_SUFFIX}"):
         stale.unlink(missing_ok=True)
@@ -113,6 +125,8 @@ def ingest_url(
         "--no-playlist",
         "--no-progress",
         "--no-cache-dir",
+        # A hint to yt-dlp, not a guarantee: it does not always abort a direct
+        # download early, so the measured check below is the enforcement.
         "--max-filesize",
         str(int(max_bytes)),
         "--output",
@@ -134,7 +148,16 @@ def ingest_url(
             f"(exit code {done.returncode})"
         )
 
-    produced = _completed_file(media_dir)
+    files = _completed_files(media_dir)
+    if len(files) > 1:
+        names = ", ".join(path.name for path in files)
+        _delete_downloads(media_dir)
+        raise MediaError(
+            f"yt-dlp exited 0 for {source} but left {len(files)} files under "
+            f"{media_dir} ({names}); refusing to cache an ambiguous download, "
+            "which usually means a video/audio pair whose merge needed ffmpeg"
+        )
+    produced = files[0] if files else None
     if produced is None:
         _delete_downloads(media_dir)
         detail = f"; stderr: {tail}" if tail else ""
@@ -151,34 +174,48 @@ def ingest_url(
     return IngestedSource(produced, size, False, tail)
 
 
-def _completed_file(media_dir: Path) -> Path | None:
-    """The completed download in `media_dir`, or None when there is none.
+def _completed_files(media_dir: Path) -> list[Path]:
+    """Every completed download in `media_dir`, ordered by name.
 
-    Only non-empty regular files without the yt-dlp `.part` suffix qualify. A
-    directory is expected to hold one file (one template, no playlists); if a
-    run leaves several, the largest and then the last name wins, deterministically.
+    Only non-empty regular files without the yt-dlp `.part` suffix qualify.
     """
     if not media_dir.is_dir():
-        return None
-    files = [
+        return []
+    return sorted(
         path
-        for path in sorted(media_dir.iterdir())
+        for path in media_dir.iterdir()
         if path.is_file()
         and not path.name.endswith(_PART_SUFFIX)
         and path.stat().st_size > 0
-    ]
+    )
+
+
+def _completed_file(media_dir: Path) -> Path | None:
+    """The completed download to reuse, or None when there is none.
+
+    A directory is expected to hold one file (one template, no playlists). If an
+    older run left several, the largest and then the last name wins, so reuse
+    stays deterministic; a *new* download that leaves several files is refused
+    by `ingest_url` instead, so only pre-existing state can reach this.
+    """
+    files = _completed_files(media_dir)
     if not files:
         return None
     return max(files, key=lambda path: (path.stat().st_size, path.name))
 
 
-def _refuse_private_host(source: str, allow_private: bool) -> None:
+def check_target_allowed(source: str, allow_private: bool) -> None:
     """Refuse a URL resolving to loopback, link-local, or RFC 1918 space.
 
     The host is resolved once with `getaddrinfo`; any private address among the
     answers refuses the call, so a name resolving to both a public and a private
     address cannot be used to reach the private one. `allow_private` is the
     caller's already-resolved `MEDIA_ALLOW_PRIVATE_URLS` switch.
+
+    This guard is public so a caller can run it *before* it creates any state
+    for the source (the server calls it before the cache entry directory
+    exists). It is pre-flight: `yt-dlp` resolves the host again and follows
+    redirects, so it does not pin the address a later connection uses.
     """
     if allow_private:
         return
@@ -213,33 +250,61 @@ def _is_private(address: str) -> bool:
     return parsed.is_loopback or parsed.is_link_local or parsed.is_private
 
 
-def _probe_seconds(source: str, path: Path) -> float:
-    """The downloaded file's probed duration, deleting it when it is unreadable."""
+def _probe_seconds(source: str, path: Path, *, cached: bool = False) -> float:
+    """The file's probed duration, deleting it when it is unreadable.
+
+    On a cache hit (`cached=True`) the file is left in place: the attempt wrote
+    nothing, and an unusable cached file is still the cache's to evict.
+    """
     try:
         return media.probe(path).duration
     except MediaError as err:
-        _delete_downloads(path.parent)
+        what = "cached" if cached else "downloaded"
+        if not cached:
+            _delete_downloads(path.parent)
+            raise MediaError(
+                f"{source}: the {what} file {path.name} cannot be probed ({err}); "
+                f"the file was deleted from {path.parent}"
+            ) from err
         raise MediaError(
-            f"{source}: the downloaded file {path} cannot be probed ({err}); "
-            f"the file was deleted from {path.parent}"
+            f"{source}: the {what} file {path} cannot be probed ({err}); "
+            "the cached file was left in place"
         ) from err
 
 
-def _refuse_size(source: str, path: Path, size: int, cap: int) -> None:
-    """Refuse an over-size download, naming both numbers, and delete it."""
-    _delete_downloads(path.parent)
+def _refuse_size(
+    source: str, path: Path, size: int, cap: int, *, cached: bool = False
+) -> None:
+    """Refuse an over-size file, naming both numbers and where it came from."""
+    what = "cached" if cached else "downloaded"
+    tail = (
+        "the cached file was left in place"
+        if cached
+        else f"the file was deleted from {path.parent}"
+    )
+    if not cached:
+        _delete_downloads(path.parent)
     raise MediaError(
-        f"{source}: the downloaded file is {size} bytes, over the {cap} byte cap; "
-        f"the file was deleted from {path.parent}"
+        f"{source}: the {what} file {path.name} is {size} bytes, over the {cap} "
+        f"byte cap; {tail}"
     )
 
 
-def _refuse_seconds(source: str, path: Path, seconds: float, cap: float) -> None:
-    """Refuse an over-long download, naming both numbers, and delete it."""
-    _delete_downloads(path.parent)
+def _refuse_seconds(
+    source: str, path: Path, seconds: float, cap: float, *, cached: bool = False
+) -> None:
+    """Refuse an over-long file, naming both numbers and where it came from."""
+    what = "cached" if cached else "downloaded"
+    tail = (
+        "the cached file was left in place"
+        if cached
+        else f"the file was deleted from {path.parent}"
+    )
+    if not cached:
+        _delete_downloads(path.parent)
     raise MediaError(
-        f"{source}: the downloaded file runs {seconds:.3f} s, over the {cap:g} s "
-        f"duration cap; the file was deleted from {path.parent}"
+        f"{source}: the {what} file {path.name} runs {seconds:.3f} s, over the "
+        f"{cap:g} s duration cap; {tail}"
     )
 
 
