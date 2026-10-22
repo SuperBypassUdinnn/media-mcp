@@ -1,16 +1,18 @@
 # Client configuration
 
-Authoritative copy of the two client snippets, so a reader of the repository does
-not have to extract them from `docs/design.md`. Both clients substitute
-environment variables inside their own configuration file, which keeps the
-snippets machine-independent; JSON itself never expands `~`.
+Authoritative copy of the live client snippet, plus the retired Antigravity one,
+so a reader of the repository does not have to extract them from
+`docs/design.md`. A client substitutes environment variables inside its own
+configuration file, which keeps a snippet machine-independent; JSON itself never
+expands `~`.
 
-- opencode uses `{env:VAR}` and a command array.
-- Antigravity uses `${VAR}` and a command plus args.
+- opencode uses `{env:VAR}` and a command array. Live.
+- Antigravity used `${VAR}` and a command plus args. Retired on 2026-10-21, and
+  its entry has been removed from that client's configuration.
 
 If a future client version stops substituting, replace the marker with the
 literal output of `echo $HOME` and record the change in
-`docs/opencode-smoke.md` or `docs/antigravity-smoke.md`.
+`docs/opencode-smoke.md`.
 
 ## opencode
 
@@ -37,10 +39,15 @@ user approves it, so a freshly added entry can read `disabled` in
 `opencode mcp list` until that project approves it. That is the plugin's gate,
 not a broken entry.
 
-## Antigravity
+## Antigravity (retired)
 
-In `~/.gemini/antigravity/mcp_config.json`, inside the existing `mcpServers`
-object:
+Not supported: the client was dropped on 2026-10-21 after its in-UI check failed,
+and the entry below was removed from `~/.gemini/antigravity/mcp_config.json` on
+2026-10-22. `docs/antigravity-smoke.md` records both halves of the evidence. The
+snippet stays here because it is the shape a `${VAR}` client needs.
+
+It went in `~/.gemini/antigravity/mcp_config.json`, inside the existing
+`mcpServers` object:
 
 ```json
     "media": {
@@ -52,22 +59,22 @@ object:
     }
 ```
 
-The entry as written depends on the client expanding `${HOME}`: launching it
+The entry as written depended on the client expanding `${HOME}`: launching it
 with the marker intact fails with `No such file or directory`, and the same
-command with the marker expanded serves all seven tools over stdio. See
-`docs/antigravity-smoke.md`, which also records the in-UI confirmation as a
-separate, explicitly pending step because a chat panel cannot be driven headlessly.
+command with the marker expanded served all seven tools over stdio. That
+mechanical proof passed; the failure was in the client's own UI, which could not
+be driven headlessly.
 
 ## One cache, one pipeline
 
-Both clients start the same server, so both read the same artifact cache at
-`~/.cache/media-mcp` and the same transcription pipeline at
+The server is client-neutral: any stdio client that starts it reads the same
+artifact cache at `~/.cache/media-mcp` and the same transcription pipeline at
 `<repo>/transcribe/transcribe.sh`. Nothing is duplicated per client.
 
 ## Settings a client may want to set
 
-Every variable has a default that works on this machine, so both configurations
-stay minimal. The ones worth knowing:
+Every variable has a default that works on this machine, so a configuration
+stays minimal. The ones worth knowing:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -125,5 +132,6 @@ Reading a frame means reading the PNG the tool returned.
 
 - `docs/design.md` sections 5, 10, and 11 for the tool table, the client
   integration rules, and the security posture.
-- `docs/opencode-smoke.md` and `docs/antigravity-smoke.md` for the observed
-  evidence behind the two snippets.
+- `docs/opencode-smoke.md` for the observed evidence behind the live snippet,
+  and `docs/antigravity-smoke.md` for the retired client.
+- `docs/image-inline-finding.md` for the measurement behind `image_inline`.

@@ -1,5 +1,9 @@
 # Antigravity smoke test
 
+Status: dropped. The mechanical proof below passed, the in-UI check failed, and
+the user retired the client on 2026-10-21 (see the end of this file). The record
+is kept as evidence and as a starting point for a future `${VAR}` client.
+
 Task 14 wires the `media` server into Antigravity and records the strongest
 evidence a headless agent can produce. The in-UI step is a separate, explicitly
 marked question, because Antigravity's server list and chat panel cannot be
@@ -113,7 +117,7 @@ reading. The run also proves the documented environment variable reaches the
 child: `MEDIA_CACHE_DIR` was passed exactly as configured and the probe wrote its
 entry there.
 
-## What is not proven
+## What is not proven, and the outcome
 
 The harness proves the configured command starts, speaks MCP, advertises seven
 tools, and answers a real call. It does **not** prove that Antigravity's own
@@ -121,8 +125,22 @@ process substitutes `${HOME}`, that its server list shows `media`, or that a cha
 call in the UI succeeds: those require the Antigravity GUI, which cannot be
 driven from a shell.
 
-Status: **user confirmation pending.** If the UI shows `media` and a chat call
-returns a probe result, the entry is confirmed as-is. If the marker is not
-substituted there, the documented fallback is to replace `${HOME}` with the
-literal output of `echo $HOME` in that file (design section 10) and record the
-outcome here.
+Status: **failed, and the client is dropped.** The user ran the in-UI check on
+2026-10-21 and reported two problems in the same panel (screenshot
+`Screenshot_20261021_222035.png`):
+
+- the customization budget was exceeded, at 22,548 tokens for skills (112.7
+  percent) with 11 entries excluded, which left the agent almost no room;
+- the server list did not show `media`.
+
+The user therefore dropped Antigravity support on 2026-10-21. On 2026-10-22 the
+`media` entry was removed from `~/.gemini/antigravity/mcp_config.json` again, so
+that file holds only its five original servers (`supabase`, `github-mcp-server`,
+`dart-mcp-server`, `gopls-mcp-server`, `alloydb-postgresql`), and the
+`~/.gemini/GEMINI.md` section that Task 15 added was removed with it, leaving
+that file at its pre-Task-15 length of 53 lines.
+
+The entry above is kept as reference for a future `${VAR}` client, not as a
+supported path. Snapshots of the four Antigravity-side files as they stand after
+the removal are under
+`~/.local/state/opencode-probe/antigravity-snapshots/20261022-213006/`.

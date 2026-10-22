@@ -30,13 +30,12 @@ faster-whisper, pyannote) and is built on demand:
 bash transcribe/setup.sh      # creates transcribe/.venv and installs its requirements
 ```
 
-Register the server with a client — one snippet each, both pointing at
+Register the server with a client, pointing it at
 `media/.venv/bin/python media/server.py`:
 
-- [opencode and Antigravity snippets](docs/client-config.md)
+- [opencode snippet](docs/client-config.md)
 - [Server design, tool surface, and safety rules](docs/design.md)
-- [Observed opencode run](docs/opencode-smoke.md) and
-  [Antigravity evidence](docs/antigravity-smoke.md)
+- [Observed opencode run](docs/opencode-smoke.md)
 
 ## A first call
 
@@ -47,10 +46,12 @@ media_manifest(source="/path/to/clip.mp4", profile="read")     # adds transcript
 media_frames(source="/path/to/clip.mp4", at="scenes")          # writes a contact sheet, returns its path
 ```
 
-Frames are returned as paths, never inlined: reading a frame means reading the
-PNG the tool returned. Every response ends with what it `computed`, reused from
-`cache`, `capped`, and `skipped`, so a truncated stage is visible instead of
-silent.
+Frames are returned as paths by default: reading a frame means reading the PNG
+the tool returned. `media_frames(image_inline=true)` also attaches up to eight of
+those PNGs as image content, which a vision model sees directly, as recorded in
+the [inline image finding](docs/image-inline-finding.md). Every response ends
+with what it `computed`, reused from `cache`, `capped`, and `skipped`, so a
+truncated stage is visible instead of silent.
 
 ## Notes
 

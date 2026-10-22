@@ -4,7 +4,7 @@ Date: 2026-10-17
 Status: draft for review
 Scope: new git repo `~/.clone/Github/media-mcp` (MCP server + promoted
 transcription pipeline), thin rework of the existing `transcribe-diarize`
-skill wrapper, client wiring for opencode and Antigravity
+skill wrapper, client wiring for opencode (Antigravity was dropped, section 10)
 
 ## 1. Context
 
@@ -36,12 +36,21 @@ skill; it remains valid and is not superseded. This spec adds the visual
 capability and reorganizes the transcription pipeline so that a second MCP
 client can use it.
 
-The second client is Antigravity, installed at `/opt/Antigravity`, reading
-MCP servers from `~/.gemini/antigravity/mcp_config.json` and
-`~/.gemini/config/mcp_config.json` in the classic
+The second client was Antigravity, installed at `/opt/Antigravity`, reading MCP
+servers from `~/.gemini/antigravity/mcp_config.json` in the classic
 `{"mcpServers": {"<name>": {"command", "args", "env"}}}` shape with `${VAR}`
-substitution. Because two clients must share one implementation, the server
-must not depend on any opencode-specific directory or configuration.
+substitution. Task 14 wired that entry and proved the command over stdio, but
+the in-UI check failed on 2026-10-21: the client reported its customization
+budget exceeded and did not list the `media` server. The user dropped Antigravity
+support the same day and the entry was removed from that file on 2026-10-22, so
+opencode is the only supported client and its snippet is the only live one.
+
+The portability requirement the second client created still holds, and the
+design keeps it: the server depends on no opencode-specific directory or
+configuration, which is why the transcription pipeline lives in the repository
+rather than inside the skill directory. A different stdio client can be wired
+from `docs/client-config.md` at any time; it would share the same server, the
+same cache, and the same pipeline.
 
 ## 2. Goals and non-goals
 
@@ -51,8 +60,8 @@ Goals:
   a stable tool surface, so that "read this video as context" works.
 - Keep the default cost of touching a video small, and let the caller raise
   it deliberately through named profiles.
-- Serve both opencode and Antigravity from one server implementation and one
-  artifact cache.
+- Serve any stdio MCP client from one server implementation and one artifact
+  cache; opencode is the client in use, as section 10 records.
 - Reuse the verified transcription pipeline instead of writing a second
   whisper implementation.
 - Never silently degrade: every fallback, cap, and refusal is reported.
@@ -81,7 +90,7 @@ does not relitigate them silently.
 
 | Decision | Choice | Rationale |
 | --- | --- | --- |
-| Container | MCP server over stdio, not an opencode plugin | Heavy ffmpeg/whisper work must not run inside the opencode process; a CUDA OOM or child-process crash must not take down the session. MCP also serves Antigravity, and the local convention is already Python stdio servers. |
+| Container | MCP server over stdio, not an opencode plugin | Heavy ffmpeg/whisper work must not run inside the opencode process; a CUDA OOM or child-process crash must not take down the session. MCP keeps the heavy stages out of the agent process, and the local convention is already Python stdio servers. |
 | Tool naming | `media_*`, server named `media` | The expensive, valuable core (diarized transcript) is identical for audio and video. Splitting them would duplicate cache, config, process, and naming for one capability. |
 | Audio scope | Unified into the same server, no extra tool | Audio adds two event types to the manifest (silence segments, loudness peaks) rather than a new tool surface. These events are directly useful for the physical-experiment video category, for example locating a loud moment. |
 | Default context cost | Cheap manifest, raised through a `profile` parameter | The caller decides how many tokens to spend. Default is metadata plus event index. |
@@ -95,9 +104,9 @@ does not relitigate them silently.
 | Frame selection | Four-stage hybrid | Scene boundaries miss gradual change (typing, a slowly rising panel value); fixed sampling misses long static passages and wastes budget. |
 | Retrieval | `media_search` is pure search over cached artifacts | It reuses work already paid for and answers "when did this happen" without guessing timestamps. No embeddings, no model downloads. |
 | GPU policy | One heavy job at a time, with a precheck | 4 GB VRAM cannot hold two jobs. The lock and the free-VRAM check make the failure mode predictable and visible. |
-| Artifact location | `~/.cache/media-mcp/`, overridable by `MEDIA_CACHE_DIR` | The cache is shared by two clients, so naming it after one of them would mislead. |
+| Artifact location | `~/.cache/media-mcp/`, overridable by `MEDIA_CACHE_DIR` | The cache is client-neutral and may be shared, so naming it after one client would mislead. |
 | Transcription pipeline | Promoted to one neutral copy in the repo; the opencode skill keeps its `SKILL.md` and becomes a thin wrapper | The stated portability trigger fired: a second consumer now exists. One copy avoids a duplicate 5 GB virtualenv and two whisper implementations. Keeping `SKILL.md` preserves the procedural knowledge (Hugging Face token setup, meaning of `--no-vad`, evidence rule) that a tool description cannot carry. |
-| Discovery | Self-sufficient tool descriptions, an opencode companion skill, one AGENTS.md pointer, one GEMINI.md section | Tool descriptions are the portable layer; the per-client pointers exist because each host's agents have different instruction files. |
+| Discovery | Self-sufficient tool descriptions, an opencode companion skill, one AGENTS.md pointer | Tool descriptions are the portable layer; the AGENTS.md pointer exists because a host's agents read an instruction file the tool list cannot reach. |
 
 ## 4. Repository layout
 
@@ -123,9 +132,9 @@ does not relitigate them silently.
 ├── docs/
 │   ├── design.md               this document
 │   ├── plan.md                 task-by-task implementation plan
-│   ├── client-config.md        opencode and Antigravity snippets
+│   ├── client-config.md        opencode snippet and the retired Antigravity one
 │   ├── opencode-smoke.md       observed opencode connection result
-│   ├── antigravity-smoke.md    observed Antigravity connection result
+│   ├── antigravity-smoke.md    why Antigravity support was dropped
 │   └── image-inline-finding.md recorded inline-image decision
 ├── README.md                   purpose, install, quickstart
 └── .gitignore                  ignores .venv/, __pycache__/, .ruff_cache/
@@ -156,7 +165,7 @@ descriptions consume model context.
 | --- | --- | --- | --- |
 | `media_probe` | light | `source`, `identity` | Duration, resolution, fps, codecs, audio layout, container, per-stream `start_time` offsets, estimated processing cost per stage |
 | `media_manifest` | light | `source`, `profile`, `scene_threshold`, `frame_budget`, `identity` | Markdown digest: summary line, scene event table, audio event table, audio-video offset warning, cache stage status |
-| `media_frames` | medium | `source`, `at` (list or `"scenes"`), `window`, `fps`, `count`, `tile`, `crop`, `labels`, `max_edge`, `identity` | Written PNG paths with timestamps; by default a single contact sheet, plus a note that `read` shows it |
+| `media_frames` | medium | `source`, `at` (list or `"scenes"`), `window`, `fps`, `count`, `tile`, `crop`, `labels`, `image_inline` (default off), `max_edge`, `identity` | Written PNG paths with timestamps; by default a single contact sheet, plus a note that `read` shows it. With `image_inline` the first 8 PNGs are attached as image content as well |
 | `media_ocr` | medium | `source`, `at`, `window`, `fps`, `count`, `crop`, `track`, `psm`, `lang`, `identity` | Text found on screen per timestamp, plus a change report when `track` is set |
 | `media_transcript` | heavy | `source`, `model`, `num_speakers`, `language`, `device`, `queue`, `identity` | Transcript text, plus paths to SRT, VTT, JSON, Markdown |
 | `media_search` | light | `source`, `query`, `k`, `scope`, `identity` | Ranked moments: timestamp, source layer (transcript or OCR), snippet |
@@ -211,7 +220,11 @@ Parameter details that are otherwise easy to misread:
   `"individual"` (one file per frame, the default for an explicit timestamp
   list). `labels` defaults to `true` and burns `HH:MM:SS.mmm` into each tile;
   when no font is usable the tool says so and returns unlabelled tiles rather
-  than failing.
+  than failing. `image_inline` defaults to `false`, which keeps the response
+  path-first and text-only; set to `true` it also attaches the returned PNGs as
+  MCP image content, at most `8` per call, and reports that cap in the status
+  block when more frames were written. A PNG that is missing from disk degrades
+  to its path in the text, with the reason named in the status block.
 - `media_ocr` applies to the same timestamps `media_frames` accepts, with
   `psm` defaulting to `6` (uniform block of text, which suits UI and slide
   content) and `lang` defaulting to `eng`. `track` defaults to `false` and is
@@ -463,7 +476,8 @@ opencode, in `~/.config/opencode/opencode.jsonc`:
 }
 ```
 
-Antigravity, in `~/.gemini/antigravity/mcp_config.json`:
+The retired Antigravity entry, kept here because it is the shape a `${VAR}`
+client needs:
 
 ```json
 {
@@ -479,23 +493,29 @@ Antigravity, in `~/.gemini/antigravity/mcp_config.json`:
 }
 ```
 
-Both clients substitute environment variables in their own configuration file,
-so the snippets stay machine-independent: opencode uses `{env:VAR}`, Antigravity
-uses `${VAR}`. If a future client version stops substituting, replace
-`{env:HOME}` or `${HOME}` with the literal output of `echo $HOME`; JSON itself
-never expands `~`.
+Antigravity support was dropped on 2026-10-21 after its UI check failed (section
+1), and the entry was removed from `~/.gemini/antigravity/mcp_config.json` on
+2026-10-22, so nothing on this machine loads the server through that client. The
+block above is reference material, not a supported path.
 
-Discovery, three layers:
+Each client substitutes environment variables in its own configuration file, so
+a snippet stays machine-independent: opencode uses `{env:VAR}`, Antigravity used
+`${VAR}`. If a future client version stops substituting, replace `{env:HOME}` or
+`${HOME}` with the literal output of `echo $HOME`; JSON itself never expands `~`.
+
+Discovery, two layers:
 
 1. Tool descriptions are self-sufficient and state when to use the tool.
 2. A new opencode skill `media-context` documents the tiered workflow, the
    meaning of each profile, and worked examples. A single pointer line is
    added to `~/.config/opencode/AGENTS.md`.
-3. A short section is appended to `~/.gemini/GEMINI.md` so Antigravity agents
-   reach for the server. Existing content in that file is preserved.
 
-`docs/client-config.md` holds the authoritative copy of both snippets, so a
-reader of the repository does not have to extract them from this document.
+The `~/.gemini/GEMINI.md` section that Task 15 added for Antigravity was removed
+again when support was dropped, so that file is byte-identical to its state
+before Task 15.
+
+`docs/client-config.md` holds the authoritative copy of the live snippet, so a
+reader of the repository does not have to extract it from this document.
 `README.md` carries only a short quickstart that links to it.
 
 An optional opencode command `/video <source>` prepares a manifest and
@@ -547,9 +567,9 @@ suggests the next step. It is a convenience, not a requirement.
   `tesseract --list-langs`.
 - Duplicate concurrent requests for the same source: inside one server
   process, an identical in-flight request is coalesced onto the running job.
-  Across two clients, the file lock in section 9 serializes heavy work, so the
-  second job runs after the first and then reuses the cache entry instead of
-  decoding again, which the response reports as a cache hit.
+  Across clients or sessions, the file lock in section 9 serializes heavy work,
+  so the second job runs after the first and then reuses the cache entry instead
+  of decoding again, which the response reports as a cache hit.
 - Cancelled request: the child process group is terminated, no cache entry is
   marked complete, and the next call for the same source recomputes rather
   than trusting a partial artifact.
@@ -573,7 +593,7 @@ suggests the next step. It is a convenience, not a requirement.
 
 | Risk | Mitigation | How it is settled |
 | --- | --- | --- |
-| Inline image delivery depends on the model, not only the client | Path-first default; `image_inline` off unless the model in use supports media in tool results | opencode issue 21227 confirms MCP `image` content is converted to an attachment and forwarded to the model, with only UI rendering missing; the remaining check is whether the model actually selected here reports media-in-tool-results support. Recorded per client and model in the README. |
+| Inline image delivery depends on the model, not only the client | Path-first default; `image_inline` off unless the model in use supports media in tool results | opencode issue 21227 confirms MCP `image` content is converted to an attachment and forwarded to the model, with only UI rendering missing. Settled by measurement: a vision model described a randomised probe image correctly, so the flag ships off by default. Recorded per host and model in `docs/image-inline-finding.md`. |
 | OCR value tracking produces false positives on noisy frames | Opt-in only, every candidate carries the raw string and per-word confidence, and output is labelled a candidate event | Synthetic slider fixture with a known injected jump; the report must name the correct timestamp, and a fixture with no numbers must return "none found". |
 | A contact sheet becomes illegible when tiles are small | `max_edge` bounds the sheet, `crop` narrows the field before tiling, and `individual` remains available | OCR of a generated sheet must recover the burned-in labels and the synthetic fixture text; frame geometry is asserted, not eyeballed. |
 | A cancelled or timed-out call leaves a child process running | Process-group termination on cancel and timeout | Start a long job, cancel it, and assert no descendant ffmpeg or whisper process remains. |
@@ -581,7 +601,7 @@ suggests the next step. It is a convenience, not a requirement.
 | 4 GB VRAM contention with other work | Single-flight lock plus free-VRAM precheck, CPU override | Unit test with injected `nvidia-smi` output, plus one forced-CPU run. |
 | Cache growth | LRU eviction with a 20 GiB default cap, enforced after each job | Observe reported eviction counts during the integration test. |
 | yt-dlp breakage on YouTube changes | Surface stderr verbatim; upgrade path documented | Out of scope to prevent; the failure is diagnosable. |
-| Scope creep across two clients and seven tools | Non-goals are explicit; inline images and any second consumer feature are deferred | Spec review. |
+| Scope creep across clients and seven tools | Non-goals are explicit; any further consumer feature stays deferred | Spec review. |
 
 ## 14. Verification plan
 
@@ -624,9 +644,10 @@ suggests the next step. It is a convenience, not a requirement.
    resolved path named.
 10. opencode smoke test: the server appears connected in `opencode mcp list`,
     and `media_probe` succeeds on the sample.
-11. Antigravity smoke test: config snippet in place, server reachable, one
-    tool call succeeds. If the client's UI requires manual confirmation, that
-    step is performed by the user and its outcome recorded.
+11. Antigravity smoke test: config snippet in place, server reachable. The
+    mechanical half passed over a real stdio session; the in-UI half failed,
+    and the user then dropped the client (section 1). The evidence stays in
+    `docs/antigravity-smoke.md`.
 12. Inline image check: with a model reported to support media in tool
     results, confirm the model receives the image; otherwise confirm the
     path-plus-`read` route, and record which route applied.
@@ -651,8 +672,10 @@ table. No item is marked complete without observed output.
 6. Implement the server layers in the order `artifacts.py`, `media.py`,
    `server.py`, with tests alongside each. The synthetic fixture generator
    comes first, because every integration assertion depends on it.
-7. Wire opencode, then Antigravity, running the smoke tests in order.
-8. Add the `media-context` skill, the AGENTS.md pointer line, and the
-   GEMINI.md section.
+7. Wire opencode and run its smoke test. Antigravity was wired next and then
+   dropped after its UI check failed (section 1), and its entry was removed
+   again, so opencode is the only wired client.
+8. Add the `media-context` skill and the AGENTS.md pointer line. The GEMINI.md
+   section was added with Task 15 and removed again with the drop.
 9. Run the image passthrough probe and record the outcome; leave
    `image_inline` off unless the result justifies enabling it.
