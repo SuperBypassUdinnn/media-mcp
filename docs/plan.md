@@ -1111,6 +1111,11 @@ git add -A && git commit -m "chore(clients): wire opencode and record smoke evid
 
 ### Task 14: Wire Antigravity and run its smoke test
 
+> Superseded 2026-10-21: the client was dropped after its in-UI check failed
+> (customization budget exceeded, no `media` server in its list), so the entry
+> was removed again. The task text stays as the record of what was planned;
+> `docs/design.md` section 1 and `docs/antigravity-smoke.md` record the outcome.
+
 **Files:**
 - Modify: `~/.gemini/antigravity/mcp_config.json`
 - Create: `docs/antigravity-smoke.md`
@@ -1160,7 +1165,8 @@ git add -A && git commit -m "chore(clients): wire antigravity and record smoke e
 - Modify: `README.md` (quickstart that links to it)
 - Create: `~/.config/opencode/skills/media-context/SKILL.md`
 - Modify: `~/.config/opencode/AGENTS.md` (one pointer line)
-- Modify: `~/.gemini/GEMINI.md` (one appended section)
+- Modify: `~/.gemini/GEMINI.md` (one appended section; removed again on
+  2026-10-22 when Antigravity was dropped, so that file is back to 53 lines)
 
 **Interfaces:**
 - Consumes: the tool surface from Task 11 and both smoke results.

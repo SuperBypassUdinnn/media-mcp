@@ -400,10 +400,14 @@ fails, every transcription tool returns an actionable error naming
 `MEDIA_TRANSCRIBE_BIN`, the resolved path, and the expected layout. There is
 no silent fallback to a worse path.
 
-The `transcribe-diarize` skill keeps its `SKILL.md` unchanged. Only
-`scripts/transcribe.sh` changes: it becomes a thin wrapper that resolves the
-new location through the same variable and forwards its arguments. The skill
-therefore keeps working standalone, including flags the server never uses.
+The `transcribe-diarize` skill keeps its `SKILL.md` as the procedural record,
+but its paths and environment names had to be corrected once the pipeline moved:
+a document that still names the old `.venv` and `requirements.txt` locations
+would send a reader to a directory that no longer holds them. `scripts/transcribe.sh`
+becomes a thin wrapper that resolves the new location through the same variable
+and forwards its arguments, and `scripts/setup.sh` becomes the same kind of
+wrapper for the moved setup. The skill therefore keeps working standalone,
+including flags the server never uses.
 
 Regression check is mandatory and mechanical: run both the old and new
 pipeline on the same short sample with the same model, then compare the
@@ -665,8 +669,10 @@ table. No item is marked complete without observed output.
    virtualenv or rebuild it from `requirements.txt`.
 3. Run the regression diff described in section 14 and record the result.
 4. Rewrite `~/.config/opencode/skills/transcribe-diarize/scripts/transcribe.sh`
-   as the forwarding wrapper. Leave `SKILL.md`, `requirements.txt`, and
-   `.env` in place.
+   as the forwarding wrapper, and `scripts/setup.sh` the same way, since the
+   virtualenv and `requirements.txt` move with the pipeline. Leave `SKILL.md`
+   and `.env` in place, correcting the paths and environment names inside
+   `SKILL.md` so they describe where the pipeline actually lives.
 5. Verify the skill still works standalone through the wrapper, including one
    flag the server does not use, such as `--denoise`.
 6. Implement the server layers in the order `artifacts.py`, `media.py`,
