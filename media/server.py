@@ -21,6 +21,7 @@ No environment variable is read at import time: every tool calls
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import json
 import os
@@ -45,6 +46,7 @@ if str(_REPO_ROOT) not in sys.path:
 import anyio
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types import ContentBlock, ImageContent, TextContent
 
 from media import artifacts, contracts, ingest, media
 from media.media import MediaError
@@ -56,6 +58,12 @@ from media.media import MediaError
 # rasterization (that is `count`'s own job).
 COUNT_DEFAULT = 8
 COUNT_CAP = 60
+# `media_frames(image_inline=true)` attaches each returned PNG to the tool
+# result as image content. The frame budget's own cap is 60, and inlining 60
+# PNGs is not a defensible default, so the inline route is bounded here; when
+# more frames exist than this, the first `INLINE_IMAGE_CAP` are attached and
+# the status block reports the cap.
+INLINE_IMAGE_CAP = 8
 FPS_DEFAULT = 2
 FPS_CAP = 30
 K_DEFAULT = 8
@@ -633,7 +641,7 @@ def _write_holder(holder_path: Path, payload: dict[str, object]) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _execute(work: Any) -> str:
+async def _execute(work: Any) -> Any:
     """Run `work(cancel)` on a daemon thread, bounded by cancellation.
 
     The body is synchronous because every stage shells out through
@@ -641,7 +649,9 @@ async def _execute(work: Any) -> str:
     loop free to deliver the peer's cancellation at the `await` here; when
     that happens the cancel event is set and every live child process group is
     stopped before the cancellation propagates, so a cancelled request leaves
-    no ffmpeg or whisper process behind and the connection stays usable.
+    no ffmpeg or whisper process behind and the connection stays usable. The
+    body's own value is returned untouched, so a tool may answer with a plain
+    text string or with a list of MCP content blocks.
     """
     cancel = threading.Event()
     outcome: dict[str, Any] = {}
@@ -663,10 +673,10 @@ async def _execute(work: Any) -> str:
         raise
     if "error" in outcome:
         raise outcome["error"]
-    return str(outcome.get("value", ""))
+    return outcome.get("value", "")
 
 
-async def _guarded(work: Any) -> str:
+async def _guarded(work: Any) -> Any:
     """Turn an anticipated `MediaError` into an actionable `ToolError`.
 
     The SDK withholds the text of any exception that is not a `ToolError`, so
@@ -1782,10 +1792,11 @@ def _frames_work(
     tile: object,
     crop: object,
     labels: bool,
+    image_inline: bool,
     max_edge: object,
     identity: str,
     cancel: threading.Event,
-) -> str:
+) -> str | list[ContentBlock]:
     # The pure validators run before the source is resolved, so an ambiguous
     # request reports the ambiguous parameter rather than a source problem.
     span = validate_window(at, window)
@@ -1888,9 +1899,43 @@ def _frames_work(
             "No usable font was found for tile labels, so the images are "
             "returned unlabelled."
         )
+    inline: list[ContentBlock] = []
+    if image_inline:
+        present = [target for _timestamp, target in written if target.is_file()]
+        notes: list[str] = []
+        if len(present) < len(written):
+            notes.append(
+                f"{_counted(len(written) - len(present), 'PNG')} missing from disk"
+            )
+        for target in present[:INLINE_IMAGE_CAP]:
+            try:
+                payload = base64.b64encode(target.read_bytes()).decode("ascii")
+            except OSError:
+                notes.append(f"{target.name} could not be read")
+                continue
+            inline.append(
+                ImageContent(type="image", data=payload, mime_type="image/png")
+            )
+        if notes:
+            report.skipped["inline"] = (
+                f"{'; '.join(notes)}; only the paths are returned"
+            )
+        if len(present) > INLINE_IMAGE_CAP:
+            report.capped.append(
+                f"inline: attached {len(inline)} of {len(present)} PNGs "
+                f"(inline cap {INLINE_IMAGE_CAP})"
+            )
+        if inline:
+            lines.append(
+                f"Inline: {_counted(len(inline), 'PNG')} above are also attached "
+                "to this response as image content."
+            )
     _evict_after_job(settings, entry, report)
     lines += ["", report.status()]
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if not inline:
+        return text
+    return [TextContent(type="text", text=text), *inline]
 
 
 def _ocr_work(
@@ -2244,9 +2289,10 @@ async def media_frames(
     tile: str | None = None,
     crop: dict | str | None = None,
     labels: bool = True,
+    image_inline: bool = False,
     max_edge: int | None = None,
     identity: str = "sampled",
-) -> str:
+) -> str | list[ContentBlock]:
     """Extract frames at given timestamps and write PNG artifacts."""
     return await _guarded(
         lambda cancel: _frames_work(
@@ -2259,6 +2305,7 @@ async def media_frames(
             tile,
             crop,
             labels,
+            image_inline,
             max_edge,
             identity,
             cancel,
@@ -2366,7 +2413,8 @@ _TOOL_DESCRIPTIONS = {
         "scene candidates). `window` samples a span around one timestamp at "
         "`fps`; `tile` chooses sheet (grid), filmstrip (vertical stack), or "
         "individual (one file per timestamp). Point the `read` tool at the "
-        "returned paths to view them."
+        "returned paths to view them. `image_inline=true` also attaches each "
+        "returned PNG (at most 8) as image content."
     ),
     "media_ocr": (
         "Recognize on-screen text at the timestamps in `at` and return it per "

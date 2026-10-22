@@ -15,6 +15,7 @@ raises as a protocol error is caught and reported the same way.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -473,6 +474,20 @@ def test_frames_write_pngs_and_point_at_read(server_session, sample):
         assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
     assert "00:00:01.000" in result.text and "00:00:02.000" in result.text
     assert "read" in result.text.lower()
+
+
+def test_frames_image_inline_sends_the_png_through_the_stdio_pipe(
+    server_session, sample
+):
+    result = server_session.call(
+        "media_frames", {"source": str(sample), "at": [1.0], "image_inline": True}
+    )
+    assert not result.is_error, result.text
+    images = [block for block in result.content if block.type == "image"]
+    assert len(images) == 1
+    assert images[0].mime_type == "image/png"
+    assert base64.b64decode(images[0].data)[:8] == b"\x89PNG\r\n\x1a\n"
+    assert "capped: (none)" in result.text
 
 
 def test_frames_sheet_mode_writes_one_composite(server_session, sample):
