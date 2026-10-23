@@ -961,7 +961,7 @@ The contract fixture launches `media/.venv/bin/python media/server.py` as a
 subprocess and speaks MCP over stdio with `mcp.client.stdio.stdio_client` plus
 `mcp.client.session.ClientSession`, which is what proves the server works as a
 client sees it; `mcp.client.Client(server)` offers an in-memory alternative but
-would not exercise the transport the two clients actually use. In this SDK
+would not exercise the transport a client actually uses. In this SDK
 version the wire fields are snake_case (`Tool.input_schema`,
 `CallToolResult.is_error`, `ImageContent.mime_type`), so the fixture exposes the
 spellings the SDK returns. Because a gracefully-exited server's children are

@@ -444,8 +444,8 @@ no reads from any client's config directory.
 
 ### 10.1 Environment variables
 
-Every setting has a default that works on this machine, so both client
-configurations can stay minimal.
+Every setting has a default that works on this machine, so a client
+configuration can stay minimal.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
