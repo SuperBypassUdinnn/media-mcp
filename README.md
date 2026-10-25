@@ -9,19 +9,17 @@ by every client.
 
 ## Quickstart
 
-Both virtualenvs are local and untracked. The server environment holds three
-direct dependencies (`mcp`, `pytest`, `ruff`) and was created with `uv`, and it
-does not carry `pip`, so `uv` is the shortest rebuild path:
+Both virtualenvs are local and untracked. The server environment was created with
+`uv` on Python 3.14 and does not carry `pip`, so `uv` is the shortest rebuild
+path. `media/requirements.txt` pins the whole closure, and was captured from the
+working venv with `uv pip freeze`; the three direct dependencies are `mcp`,
+`pytest`, and `ruff`:
 
 ```bash
 uv venv media/.venv --python 3.14
-uv pip install --python media/.venv/bin/python mcp pytest ruff
+uv pip install --python media/.venv/bin/python -r media/requirements.txt
 media/.venv/bin/python -m pytest -q
 ```
-
-The virtualenv is not reproducible from a committed manifest: `media/` ships no
-`requirements.txt`, so the direct dependencies above are the record. Committing a
-pinned manifest is a known gap, not an intentional simplification.
 
 The transcription pipeline is a separate, much larger environment (torch,
 faster-whisper, pyannote) and is built on demand:

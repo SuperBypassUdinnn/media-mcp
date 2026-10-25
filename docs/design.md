@@ -122,6 +122,7 @@ does not relitigate them silently.
 │   ├── media.py                ffprobe, scene detection, frames, OCR, audio events
 │   ├── artifacts.py            identity, cache store, LRU eviction, search
 │   ├── contracts.py            delegated CLI contract and its self-check
+│   ├── requirements.txt        pinned closure for the server virtualenv
 │   └── .venv/                  local only, not committed
 ├── tests/
 │   ├── test_artifacts.py
