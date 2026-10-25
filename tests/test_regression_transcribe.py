@@ -38,6 +38,21 @@ SENTENCE = (
 MODEL = os.environ.get("MEDIA_TRANSCRIBE_TEST_MODEL", "tiny")
 TIMEOUT_SECONDS = int(os.environ.get("MEDIA_TRANSCRIBE_TEST_TIMEOUT", "900"))
 
+# The pipeline lives in its own virtualenv (torch, faster-whisper, pyannote: tens
+# of gigabytes), which a fresh checkout and CI do not build, so this regression
+# skips rather than fails there.
+PIPELINE_PYTHON = REPO_ROOT / "transcribe" / ".venv" / "bin" / "python"
+
+
+def _require_pipeline() -> None:
+    """Skip when the pipeline virtualenv the wrappers bootstrap is absent."""
+    if not PIPELINE_PYTHON.is_file():
+        pytest.skip(
+            "the transcription pipeline virtualenv is not built at "
+            f"{PIPELINE_PYTHON}; run `bash transcribe/setup.sh` to enable this "
+            "regression (it installs torch and faster-whisper)"
+        )
+
 
 def _speech_sample(directory: Path) -> Path:
     """Render `SENTENCE` with espeak-ng, or skip when it is not installed."""
@@ -96,6 +111,7 @@ def _segments(payload: dict) -> list[str]:
 
 def test_moved_pipeline_matches_the_original_segments(tmp_path: Path) -> None:
     """Both wrappers drive the same moved pipeline over the same speech."""
+    _require_pipeline()
     sample = _speech_sample(tmp_path)
 
     moved_payload = _run_pipeline(WRAPPER, sample, tmp_path / "moved")

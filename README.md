@@ -28,6 +28,12 @@ faster-whisper, pyannote) and is built on demand:
 bash transcribe/setup.sh      # creates transcribe/.venv and installs its requirements
 ```
 
+That environment is optional for the test suite: the regression that drives the
+pipeline skips when `transcribe/.venv` is absent, so a checkout with only the
+server venv still runs every other test. `.github/workflows/ci.yml` builds exactly
+that environment, which is also the fastest way to reproduce a failing run
+locally.
+
 Register the server with a client, pointing it at
 `media/.venv/bin/python media/server.py`:
 
