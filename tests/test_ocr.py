@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+import subprocess
 import zlib
 from dataclasses import replace
 from pathlib import Path
@@ -141,3 +142,29 @@ def _solid_png(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
         + chunk(b"IDAT", zlib.compress(row * height))
         + chunk(b"IEND", b"")
     )
+
+
+def test_a_failing_language_listing_never_masks_the_original_ocr_error(monkeypatch):
+    """The listing is a courtesy: its own failure is appended, not substituted.
+
+    A missing language pack is the failure the caller has to act on, so the
+    message must survive even when asking tesseract which packs exist fails too.
+    """
+    done = subprocess.CompletedProcess(
+        args=["tesseract", "-", "-", "-l", "ind", "--psm", "6", "tsv"],
+        returncode=1,
+        stdout="",
+        stderr="Error opening data file /usr/share/tessdata/ind.traineddata",
+    )
+
+    def boom() -> list[str]:
+        raise media.MediaError("tesseract could not list its languages: exited 1")
+
+    monkeypatch.setattr(media, "ocr_available_langs", boom)
+    error = media._ocr_failure(done, "ind")
+
+    assert isinstance(error, media.MediaError)
+    message = str(error)
+    assert "no language pack 'ind'" in message
+    assert "Error opening data file" in message
+    assert "the language listing also failed" in message

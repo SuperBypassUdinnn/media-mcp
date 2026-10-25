@@ -508,3 +508,132 @@ def _duration_line(text: str) -> str:
     lines = [line for line in text.splitlines() if line.startswith("Duration: ")]
     assert len(lines) == 1, f"expected exactly one Duration line in:\n{text}"
     return lines[0]
+
+
+def test_a_failed_download_removes_the_entry_this_attempt_created(
+    served, shim, tmp_path, monkeypatch
+) -> None:
+    """A failed attempt must not leave the empty entry the listing showed."""
+    _clip, url = served
+    entry = tmp_path / "entries" / "abc123"
+    monkeypatch.setenv("FAKE_YTDLP_FAIL", "1")
+    monkeypatch.setenv("FAKE_YTDLP_STDERR", "ERROR: this video is unavailable")
+
+    with pytest.raises(media.MediaError) as failed:
+        ingest.ingest_url(
+            url,
+            entry,
+            max_bytes=_ROOMY_BYTES,
+            max_seconds=_ROOMY_SECONDS,
+            allow_private=True,
+            timeout_seconds=_TIMEOUT,
+        )
+
+    assert "the empty cache entry was removed" in str(failed.value)
+    assert not entry.exists(), "the entry this attempt made must be gone"
+
+
+def test_a_failed_download_leaves_a_pre_existing_entry_in_place(
+    served, shim, tmp_path, monkeypatch
+) -> None:
+    """Only an entry this attempt made is removed: an existing one always stays.
+
+    The entry here holds nothing reusable, which is the case where the removal
+    logic has a choice; the guarantee under test is that it is the attempt's own
+    directory that may go, never one that was already there.
+    """
+    _clip, url = served
+    entry = tmp_path / "entries" / "abc123"
+    media_dir = entry / "media"
+    media_dir.mkdir(parents=True)
+
+    monkeypatch.setenv("FAKE_YTDLP_FAIL", "1")
+    monkeypatch.setenv("FAKE_YTDLP_STDERR", "ERROR: this video is unavailable")
+
+    with pytest.raises(media.MediaError) as failed:
+        ingest.ingest_url(
+            url,
+            entry,
+            max_bytes=_ROOMY_BYTES,
+            max_seconds=_ROOMY_SECONDS,
+            allow_private=True,
+            timeout_seconds=_TIMEOUT,
+        )
+
+    assert "the empty cache entry was removed" not in str(failed.value)
+    assert entry.is_dir(), "a pre-existing entry must not be removed"
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores the permission bits this case depends on",
+)
+def test_an_unreadable_entry_directory_is_named_not_leaked(tmp_path) -> None:
+    """An unreadable entry has to name the entry, not leak a bare OSError."""
+    entry = tmp_path / "entries" / "abc123"
+    media_dir = entry / "media"
+    media_dir.mkdir(parents=True)
+    media_dir.chmod(0o000)
+    try:
+        with pytest.raises(media.MediaError) as failed:
+            ingest.ingest_url(
+                "http://example.invalid/clip.mp4",
+                entry,
+                max_bytes=_ROOMY_BYTES,
+                max_seconds=_ROOMY_SECONDS,
+                allow_private=True,
+                timeout_seconds=_TIMEOUT,
+            )
+    finally:
+        media_dir.chmod(0o755)
+
+    message = str(failed.value)
+    assert "cannot read the cache entry" in message
+    assert str(entry) in message
+
+
+def test_a_cached_file_that_vanishes_mid_scan_reads_as_a_miss(
+    tmp_path, monkeypatch
+) -> None:
+    """A concurrent eviction is a cache miss, never a crash."""
+    entry = tmp_path / "entry"
+    media_dir = entry / "media"
+    media_dir.mkdir(parents=True)
+    cached = media_dir / "clip.mp4"
+    cached.write_bytes(b"x" * 4096)
+
+    real_stat = Path.stat
+
+    def vanishing(self: Path, *args, **kwargs):
+        if self == cached:
+            raise FileNotFoundError(2, "No such file or directory", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", vanishing)
+    assert ingest.cached_download(entry) is None
+
+
+def test_a_cached_file_that_cannot_be_read_is_named_not_called_a_miss(
+    tmp_path, monkeypatch
+) -> None:
+    """Only a vanished file is a miss: an unreadable one is reported."""
+    entry = tmp_path / "entry"
+    media_dir = entry / "media"
+    media_dir.mkdir(parents=True)
+    cached = media_dir / "clip.mp4"
+    cached.write_bytes(b"x" * 4096)
+
+    real_stat = Path.stat
+
+    def unreadable(self: Path, *args, **kwargs):
+        if self == cached:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", unreadable)
+    with pytest.raises(media.MediaError) as failed:
+        ingest.cached_download(entry)
+
+    message = str(failed.value)
+    assert "cannot read the cached file" in message
+    assert cached.name in message

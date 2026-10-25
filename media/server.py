@@ -826,6 +826,8 @@ def _entry_for(
     if ingest.is_url(source):
         resolved = _identity_for(source, identity)
         entry = artifacts.entry_path(resolved, settings.cache_dir)
+        # `cached_download` names an unreadable entry as a MediaError, which
+        # `/guarded` turns into an actionable tool error.
         if ingest.cached_download(entry) is None:
             ingest.check_target_allowed(source, settings.allow_private_urls)
             entry = artifacts.entry_dir(resolved, settings.cache_dir)
@@ -1303,9 +1305,34 @@ def _resolve_crop_box(
     return media.resolve_crop(crop_spec, result, path, start, stop, fps)
 
 
-def _render_frame(timestamp: float, png: bytes, labels: bool, max_edge: int) -> bytes:
-    """Return one labelled, bounded frame image (a one-tile sheet)."""
-    return media.render_sheet([(timestamp, png)], labels, max_edge)
+def _render_frame(
+    timestamp: float,
+    png: bytes,
+    labels: bool,
+    max_edge: int,
+    scratch_dir: Path | None = None,
+    notes: list[str] | None = None,
+) -> bytes:
+    """Return one labelled, bounded frame image (a one-tile sheet).
+
+    `scratch_dir` stages the tile and ASS intermediates in the caller's cache
+    entry rather than the OS temp directory, and `notes` receives the reason a
+    label could not be burned instead of failing the whole render.
+    """
+    return media.render_sheet([(timestamp, png)], labels, max_edge, scratch_dir, notes)
+
+
+def _report_label_notes(report: _Report, notes: list[str]) -> None:
+    """Add per-tile label degradations to the status block, never overwriting it.
+
+    A tile whose label could not be burned is returned unlabelled, and the
+    reason has to reach the caller: the design forbids a silent degradation.
+    """
+    if not notes:
+        return
+    joined = "; ".join(notes)
+    prior = report.skipped.get("labels")
+    report.skipped["labels"] = f"{prior}; {joined}" if prior else joined
 
 
 def _visual_stage(
@@ -1326,6 +1353,7 @@ def _visual_stage(
     under `ocr/`, both reused when they already exist. The record's text and
     confidence are what `media_search(scope="ocr")` reads later.
     """
+    label_notes: list[str] = []
     selected = candidates[:count]
     if not selected:
         report.skipped["ocr"] = "no frame candidates were available to OCR"
@@ -1359,7 +1387,9 @@ def _visual_stage(
             )
             continue
         png = media.extract_frame(path, timestamp, None, max_edge)
-        frame_path.write_bytes(_render_frame(timestamp, png, labels, max_edge))
+        frame_path.write_bytes(
+            _render_frame(timestamp, png, labels, max_edge, entry, label_notes)
+        )
         recognized = media.ocr_png(png, psm=psm, lang=lang)
         _write_json(
             ocr_path,
@@ -1372,6 +1402,7 @@ def _visual_stage(
                 "text": recognized.text,
             }
         )
+    _report_label_notes(report, label_notes)
     report.computed.append("frames")
     report.computed.append("ocr")
     return records
@@ -1850,11 +1881,14 @@ def _frames_work(
 
     frames_dir = artifacts.stage_path(entry, "frames/")
     written: list[tuple[float, Path]] = []
+    label_notes: list[str] = []
     if mode == "individual":
         for timestamp in stamps:
             png = media.extract_frame(path, timestamp, box, edge)
             target = frames_dir / f"{_file_stamp(timestamp)}.png"
-            target.write_bytes(_render_frame(timestamp, png, labels, edge))
+            target.write_bytes(
+                _render_frame(timestamp, png, labels, edge, entry, label_notes)
+            )
             written.append((timestamp, target))
     else:
         pairs = [
@@ -1862,14 +1896,15 @@ def _frames_work(
             for timestamp in stamps
         ]
         if mode == "sheet":
-            composite = media.render_sheet(pairs, labels, edge)
+            composite = media.render_sheet(pairs, labels, edge, entry, label_notes)
         else:
-            composite = media.render_filmstrip(pairs, labels, edge)
+            composite = media.render_filmstrip(pairs, labels, edge, entry, label_notes)
         target = frames_dir / (
             f"{_file_stamp(stamps[0])}-{_file_stamp(stamps[-1])}.png"
         )
         target.write_bytes(composite)
         written.append((stamps[0], target))
+    _report_label_notes(report, label_notes)
     report.computed.append("frames")
     if box is not None:
         report.extras.append(

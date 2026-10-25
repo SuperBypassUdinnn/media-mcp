@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -57,6 +58,59 @@ def test_out_of_bounds_crop_is_rejected_with_measured_size(tmp_path):
             {"x": 0, "y": 0, "width": 99999, "height": 10}, probe_of(src), src, 0, 1, 1
         )
     assert str(probe_of(src).width) in str(err.value)
+
+
+def test_render_stages_under_the_callers_scratch_dir(tmp_path, monkeypatch):
+    # The caller owns a cache entry directory on the same filesystem as its
+    # output, so the staging root must be selectable: with `scratch_dir` set,
+    # neither the tile files nor the ASS documents land in the OS temp dir.
+    src = fixtures.make_motion_patch(tmp_path / "src.mp4")
+    frames = [
+        (float(i), media.extract_frame(src, float(i), None, 320)) for i in range(3)
+    ]
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    system_temp = Path(tempfile.gettempdir())
+    leaked: list[str] = []
+    real_run_child = media.run_child
+
+    def spying_run_child(argv, **kwargs):
+        for prefix in ("media-tiles-*", "media-ass-*"):
+            leaked.extend(str(path) for path in system_temp.glob(prefix))
+        return real_run_child(argv, **kwargs)
+
+    monkeypatch.setattr(media, "run_child", spying_run_child)
+    sheet = media.render_sheet(frames, labels=True, max_edge=400, scratch_dir=scratch)
+    assert png_size(sheet)[0] <= 400
+    assert leaked == [], f"staging leaked into the system temp dir: {leaked}"
+
+
+def test_one_tile_label_failure_degrades_that_tile_only(tmp_path, monkeypatch):
+    # A label is decoration: one tile's burn failing must not fail the whole
+    # sheet. The failed tile falls back to unlabelled, the others keep their
+    # labels, and the reason is reported rather than swallowed.
+    src = fixtures.make_motion_patch(tmp_path / "src.mp4")
+    frames = [
+        (float(i), media.extract_frame(src, float(i), None, 320)) for i in range(3)
+    ]
+    doomed = 1.0
+    real_label_tile = media._label_tile
+    labelled: list[float] = []
+
+    def flaky(frame, timestamp, dimensions, family, font, scratch_dir=None):
+        if timestamp == doomed:
+            raise media.MediaError("label burn simulated failure")
+        labelled.append(timestamp)
+        return real_label_tile(frame, timestamp, dimensions, family, font, scratch_dir)
+
+    monkeypatch.setattr(media, "_label_tile", flaky)
+    notes: list[str] = []
+    sheet = media.render_sheet(frames, labels=True, max_edge=400, notes=notes)
+
+    assert png_size(sheet)[0] <= 400, "one failed tile must not fail the sheet"
+    assert labelled == [0.0, 2.0], "the other tiles stay labelled"
+    assert len(notes) == 1, notes
+    assert "1.0" in notes[0] and "simulated failure" in notes[0]
 
 
 def test_missing_font_yields_unlabelled_tiles(tmp_path, monkeypatch):

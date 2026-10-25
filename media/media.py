@@ -752,7 +752,10 @@ def diff_hash(png_bytes: bytes) -> int:
     bytes survive the text-typed child result through `run_child`'s
     latin-1 bijection. A non-zero ffmpeg exit or an empty raster raises
     `MediaError` — a malformed PNG is the caller's broken frame, named as
-    such.
+    such. The geometry is pinned: a raster that is not exactly 32x32x1
+    bytes also raises, naming the byte count it saw, so a future ffmpeg
+    that emitted a different size cannot be hashed silently while the
+    comparisons keep claiming to be valid.
     """
     argv = [
         "ffmpeg",
@@ -780,6 +783,13 @@ def diff_hash(png_bytes: bytes) -> int:
             "diff_hash could not downscale a frame to "
             f"{_GRAY_SIZE}x{_GRAY_SIZE} gray: ffmpeg exited "
             f"{done.returncode}; captured stderr: {done.stderr.strip() or '(none)'}"
+        )
+    expected = _GRAY_SIZE * _GRAY_SIZE
+    if len(raster) != expected:
+        raise MediaError(
+            f"diff_hash expected a {expected}-byte {_GRAY_SIZE}x{_GRAY_SIZE} gray "
+            f"raster from ffmpeg, got {len(raster)} bytes; a changed raster "
+            "geometry would make hamming comparisons mean something else"
         )
     return diff_hash_of(raster)
 
@@ -1600,7 +1610,13 @@ def extract_frame(
     return frame
 
 
-def render_sheet(pngs: list[tuple[float, bytes]], labels: bool, max_edge: int) -> bytes:
+def render_sheet(
+    pngs: list[tuple[float, bytes]],
+    labels: bool,
+    max_edge: int,
+    scratch_dir: Path | None = None,
+    notes: list[str] | None = None,
+) -> bytes:
     """Composite frames into one labelled contact sheet, PNG bytes.
 
     Frames arrive as `(timestamp, image_bytes)` already rasterized; the
@@ -1610,12 +1626,24 @@ def render_sheet(pngs: list[tuple[float, bytes]], labels: bool, max_edge: int) -
     `labels` is true and a font is resolvable. A missing font yields
     unlabelled tiles and no error — a label is decoration, never a
     precondition. The sheet's width stays under `max_edge` by construction.
+    One tile's label failing is equally non-fatal: that tile is returned
+    unlabelled and the reason is appended to `notes`, so a caller can state
+    the degradation instead of hiding it.
+
+    `scratch_dir` is the root for the intermediate tile and ASS files: the
+    caller passes a directory on the output filesystem (the cache entry it
+    already owns) so intermediates never land in the OS temp directory, and
+    `None` keeps the OS temp directory as the default.
     """
-    return _render_composite(pngs, labels, max_edge, "sheet")
+    return _render_composite(pngs, labels, max_edge, "sheet", scratch_dir, notes)
 
 
 def render_filmstrip(
-    pngs: list[tuple[float, bytes]], labels: bool, max_edge: int
+    pngs: list[tuple[float, bytes]],
+    labels: bool,
+    max_edge: int,
+    scratch_dir: Path | None = None,
+    notes: list[str] | None = None,
 ) -> bytes:
     """Composite frames into one vertical filmstrip, PNG bytes.
 
@@ -1623,9 +1651,10 @@ def render_filmstrip(
     smallest width among them capped at `max_edge` (even, because vstack
     demands equal widths); each frame keeps whatever crop it already
     carried when it was extracted, and its aspect survives the scale.
-    Labels follow the same rule as the sheet.
+    Labels follow the same rule as the sheet, and `scratch_dir` selects the
+    staging root exactly as `render_sheet` documents it.
     """
-    return _render_composite(pngs, labels, max_edge, "filmstrip")
+    return _render_composite(pngs, labels, max_edge, "filmstrip", scratch_dir, notes)
 
 
 def resolve_font() -> Path | None:
@@ -1840,17 +1869,35 @@ def _scale_tile_box_back(
     return Box(x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
 
+def _staging_dir(prefix: str, scratch_dir: Path | None) -> tempfile.TemporaryDirectory:
+    """A temporary directory, under `scratch_dir` when the caller chose one.
+
+    `None` keeps the OS temp directory as today's default; a caller-chosen
+    root stages beside its output so nothing large crosses filesystems.
+    """
+    if scratch_dir is None:
+        return tempfile.TemporaryDirectory(prefix=prefix)
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=scratch_dir)
+
+
 def _render_composite(
-    pngs: list[tuple[float, bytes]], labels: bool, max_edge: int, mode: str
+    pngs: list[tuple[float, bytes]],
+    labels: bool,
+    max_edge: int,
+    mode: str,
+    scratch_dir: Path | None = None,
+    notes: list[str] | None = None,
 ) -> bytes:
     """Stack frames into one image through a single ffmpeg filter graph.
 
     The per-tile work happens first (label burn through one `ass` filter per
     distinct text, one ASS document per tile written to a scratch directory
-    the OS cleans up), the labelled tiles land as files so one compositing
-    ffmpeg can read them as inputs, and the stacking itself is one graph —
-    `xstack` for the sheet, `vstack` for the filmstrip. A missing font turns
-    labels off silently; every real failure raises.
+    the OS cleans up — or `scratch_dir`, the caller's chosen root), the
+    labelled tiles land as files so one compositing ffmpeg can read them as
+    inputs, and the stacking itself is one graph — `xstack` for the sheet,
+    `vstack` for the filmstrip. A missing font turns labels off silently and
+    a per-tile burn failure degrades that tile to unlabelled (its reason
+    appended to `notes`); the compositing itself still raises on failure.
     """
     if not pngs:
         raise MediaError(f"{mode} render received no frames to composite")
@@ -1860,7 +1907,7 @@ def _render_composite(
         )
     frames = [frame for _, frame in pngs]
     dimensions = [_image_dimensions(frame) for frame in frames]
-    with tempfile.TemporaryDirectory(prefix="media-tiles-") as scratch:
+    with _staging_dir("media-tiles-", scratch_dir) as scratch:
         root = Path(scratch)
         tiles = [root / f"{index:04d}.png" for index in range(len(frames))]
         for tile_path, frame in zip(tiles, frames):
@@ -1870,9 +1917,24 @@ def _render_composite(
             if font is not None:
                 family = _font_family(font) or "monospace"
                 for index, (timestamp, frame) in enumerate(pngs):
-                    tiles[index].write_bytes(
-                        _label_tile(frame, timestamp, dimensions[index], family, font)
-                    )
+                    try:
+                        labelled = _label_tile(
+                            frame,
+                            timestamp,
+                            dimensions[index],
+                            family,
+                            font,
+                            scratch_dir,
+                        )
+                    except MediaError as err:
+                        if notes is not None:
+                            notes.append(
+                                f"the label for the tile at "
+                                f"{_timestamp_label(timestamp)} could not be "
+                                f"burned ({err}); that tile is unlabelled"
+                            )
+                        continue
+                    tiles[index].write_bytes(labelled)
         graph = _composite_graph(mode, max_edge, dimensions)
         argv = ["ffmpeg", "-hide_banner", "-nostdin"]
         for tile_path in tiles:
@@ -1973,6 +2035,7 @@ def _label_tile(
     dimensions: tuple[int, int],
     family: str,
     font: Path,
+    scratch_dir: Path | None = None,
 ) -> bytes:
     """Burn `HH:MM:SS.mmm` into one frame's top-left corner through `ass`.
 
@@ -1982,14 +2045,15 @@ def _label_tile(
     `_LABEL_FONT_REFERENCE_*`), so a big sheet and a small filmstrip carry
     equally legible labels in that same measured proportion. Fontconfig
     noise on stderr is not failure: only the exit code and an empty payload
-    decide.
+    decide. `scratch_dir` selects where the ASS document is staged, exactly
+    as `render_sheet` documents it.
     """
     width, height = dimensions
     size = max(
         _LABEL_FONT_SIZE_MIN,
         round(width * _LABEL_FONT_REFERENCE_SIZE / _LABEL_FONT_REFERENCE_WIDTH),
     )
-    with tempfile.TemporaryDirectory(prefix="media-ass-") as scratch:
+    with _staging_dir("media-ass-", scratch_dir) as scratch:
         document = Path(scratch) / "label.ass"
         document.write_text(
             _label_ass_document(
@@ -2334,7 +2398,12 @@ def _ocr_failure(done: CompletedProcess[str], lang: str) -> MediaError:
     stderr = done.stderr.strip()
     if any(marker in stderr for marker in _MISSING_LANGUAGE_MARKERS):
         first_line = next((line for line in stderr.splitlines() if line.strip()), "")
-        available = ", ".join(ocr_available_langs()) or "(none)"
+        try:
+            available = ", ".join(ocr_available_langs()) or "(none)"
+        except MediaError as listing_error:
+            # The listing is a courtesy: it must never replace the failure the
+            # caller has to act on, so its own failure is appended as context.
+            available = f"(the language listing also failed: {listing_error})"
         return MediaError(
             f"tesseract has no language pack {lang!r}: {first_line}; "
             f"available languages: {available}"

@@ -102,10 +102,13 @@ def ingest_url(
     is over either limit, naming the host and `MEDIA_ALLOW_PRIVATE_URLS` when a
     private target is refused, and carrying yt-dlp's exit code and final stderr
     lines verbatim when the child fails. Every refusal and failure on the
-    download path deletes what this call produced; a cache hit runs no download,
-    and an over-cap cache hit is refused by name and left in place.
+    download path deletes what this call produced and, when this call created the
+    entry, the entry itself once nothing is left in it; a cache hit runs no
+    download, a pre-existing entry is never removed, and an over-cap cache hit is
+    refused by name and left in place.
     """
-    media_dir = Path(entry) / MEDIA_DIR_NAME
+    entry_dir = Path(entry)
+    media_dir = entry_dir / MEDIA_DIR_NAME
     cached = cached_download(entry)
     if cached is not None:
         size = cached.stat().st_size
@@ -116,8 +119,30 @@ def ingest_url(
             _refuse_seconds(source, cached, seconds, max_seconds, cached=True)
         return IngestedSource(cached, size, True, "")
 
+    created_entry = not entry_dir.exists()
     check_target_allowed(source, allow_private)
     media_dir.mkdir(parents=True, exist_ok=True)
+
+    def cleanup_after_failure() -> str:
+        """Delete this attempt's files and, when this attempt made it, its entry.
+
+        The returned sentence belongs at the end of the failure message. Only an
+        entry this attempt created and that holds nothing is removed, so a failed
+        download cannot leave the empty entry the cache listing used to report as
+        `(unknown) | 0`, and no pre-existing entry is ever touched. A removal that
+        does not succeed is stated rather than passed over in silence.
+        """
+        _delete_downloads(media_dir)
+        if not created_entry:
+            return ""
+        try:
+            if media_dir.is_dir():
+                media_dir.rmdir()
+            entry_dir.rmdir()
+        except OSError as err:
+            return f"; its empty cache entry could not be removed ({err})"
+        return "; the empty cache entry was removed"
+
     for stale in media_dir.glob(f"*{_PART_SUFFIX}"):
         stale.unlink(missing_ok=True)
 
@@ -139,39 +164,51 @@ def ingest_url(
     except BaseException:
         # A timeout or a cancellation is already a MediaError naming the child;
         # the half-written file must still go.
-        _delete_downloads(media_dir)
+        cleanup_after_failure()
         raise
     tail = _stderr_tail(done.stderr)
     if done.returncode != 0:
-        _delete_downloads(media_dir)
+        note = cleanup_after_failure()
         raise MediaError(
             f"yt-dlp could not download {source}: {tail or '(no stderr)'} "
-            f"(exit code {done.returncode})"
+            f"(exit code {done.returncode}){note}"
         )
 
     files = _completed_files(media_dir)
     if len(files) > 1:
         names = ", ".join(path.name for path in files)
-        _delete_downloads(media_dir)
+        note = cleanup_after_failure()
         raise MediaError(
             f"yt-dlp exited 0 for {source} but left {len(files)} files under "
             f"{media_dir} ({names}); refusing to cache an ambiguous download, "
-            "which usually means a video/audio pair whose merge needed ffmpeg"
+            f"which usually means a video/audio pair whose merge needed ffmpeg{note}"
         )
     produced = files[0] if files else None
     if produced is None:
-        _delete_downloads(media_dir)
         detail = f"; stderr: {tail}" if tail else ""
+        note = cleanup_after_failure()
         raise MediaError(
-            f"yt-dlp exited 0 for {source} but wrote no file under {media_dir}{detail}"
+            f"yt-dlp exited 0 for {source} but wrote no file under "
+            f"{media_dir}{detail}{note}"
         )
 
-    size = produced.stat().st_size
-    if size > max_bytes:
-        _refuse_size(source, produced, size, max_bytes)
-    seconds = _probe_seconds(source, produced)
-    if seconds > max_seconds:
-        _refuse_seconds(source, produced, seconds, max_seconds)
+    try:
+        size = produced.stat().st_size
+        if size > max_bytes:
+            _refuse_size(source, produced, size, max_bytes)
+        seconds = _probe_seconds(source, produced)
+        if seconds > max_seconds:
+            _refuse_seconds(source, produced, seconds, max_seconds)
+    except MediaError:
+        cleanup_after_failure()
+        raise
+    except OSError as err:
+        # A concurrent eviction between the scan and the measurement must read
+        # as a named failure, not as a bare traceback the SDK would swallow.
+        note = cleanup_after_failure()
+        raise MediaError(
+            f"{source}: the downloaded file could not be measured ({err}){note}"
+        ) from err
     return IngestedSource(produced, size, False, tail)
 
 
@@ -179,25 +216,47 @@ def cached_download(entry: Path) -> Path | None:
     """The completed download already under `entry`, or `None`.
 
     A pure read: it creates nothing and touches no network, so a caller can ask
-    whether a URL is already cached before it guards or resolves anything.
+    whether a URL is already cached before it guards or resolves anything. An
+    entry directory that cannot be read raises `MediaError` naming it, so a
+    permission-struck or corrupt cache never surfaces as a bare traceback the
+    SDK would hide.
     """
-    return _completed_file(Path(entry) / MEDIA_DIR_NAME)
+    try:
+        return _completed_file(Path(entry) / MEDIA_DIR_NAME)
+    except OSError as err:
+        raise MediaError(f"cannot read the cache entry {Path(entry)}: {err}") from err
+
+
+def _is_completed(path: Path) -> bool:
+    """Whether `path` is a completed, non-empty download right now.
+
+    A file that vanished between the directory scan and this check is not a
+    completed download: a concurrent eviction has to read as a cache miss. A file
+    that is present but cannot be read is a different case and raises, because
+    calling it a miss would hide a broken cache instead of reporting it.
+    """
+    try:
+        return (
+            path.is_file()
+            and not path.name.endswith(_PART_SUFFIX)
+            and path.stat().st_size > 0
+        )
+    except FileNotFoundError:
+        return False
+    except OSError as err:
+        raise MediaError(f"cannot read the cached file {path}: {err}") from err
 
 
 def _completed_files(media_dir: Path) -> list[Path]:
     """Every completed download in `media_dir`, ordered by name.
 
-    Only non-empty regular files without the yt-dlp `.part` suffix qualify.
+    Only non-empty regular files without the yt-dlp `.part` suffix qualify, and a
+    file that disappears or becomes unreadable mid-scan is skipped rather than
+    raised: it is no longer a completed download.
     """
     if not media_dir.is_dir():
         return []
-    return sorted(
-        path
-        for path in media_dir.iterdir()
-        if path.is_file()
-        and not path.name.endswith(_PART_SUFFIX)
-        and path.stat().st_size > 0
-    )
+    return sorted(path for path in media_dir.iterdir() if _is_completed(path))
 
 
 def _completed_file(media_dir: Path) -> Path | None:
@@ -206,12 +265,23 @@ def _completed_file(media_dir: Path) -> Path | None:
     A directory is expected to hold one file (one template, no playlists). If an
     older run left several, the largest and then the last name wins, so reuse
     stays deterministic; a *new* download that leaves several files is refused
-    by `ingest_url` instead, so only pre-existing state can reach this.
+    by `ingest_url` instead, so only pre-existing state can reach this. A file
+    that vanishes between the scan and the ranking drops out instead of raising,
+    and when every candidate has gone the answer is a miss; a file that is
+    present but unreadable has already raised inside `_completed_files`.
     """
+
+    def rank(path: Path) -> tuple[int, str]:
+        try:
+            return (path.stat().st_size, path.name)
+        except FileNotFoundError:
+            return (0, path.name)
+
     files = _completed_files(media_dir)
     if not files:
         return None
-    return max(files, key=lambda path: (path.stat().st_size, path.name))
+    best = max(files, key=rank)
+    return best if rank(best)[0] > 0 else None
 
 
 def check_target_allowed(source: str, allow_private: bool) -> None:

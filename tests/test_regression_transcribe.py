@@ -54,11 +54,13 @@ def _speech_sample(directory: Path) -> Path:
     return sample
 
 
-def _run_pipeline(wrapper: Path, sample: Path, out_dir: Path) -> list[str]:
-    """Run one wrapper over `sample` and return `speaker|text` per segment.
+def _run_pipeline(wrapper: Path, sample: Path, out_dir: Path) -> dict:
+    """Run one wrapper over `sample` and return its JSON sidecar payload.
 
     The wrapper is invoked through `bash`, so a missing executable bit cannot
-    decide the comparison.
+    decide the comparison. The whole payload comes back rather than just the
+    segments, because the model each side recorded is asserted separately: a
+    silent model substitution would leave the segments identical.
     """
     done = subprocess.run(
         [
@@ -81,7 +83,11 @@ def _run_pipeline(wrapper: Path, sample: Path, out_dir: Path) -> list[str]:
     )
     transcript = out_dir / sample.stem / f"{sample.stem}.json"
     assert transcript.is_file(), f"the run wrote no {transcript}"
-    payload = json.loads(transcript.read_text(encoding="utf-8"))
+    return json.loads(transcript.read_text(encoding="utf-8"))
+
+
+def _segments(payload: dict) -> list[str]:
+    """`speaker|text` per segment, the comparison unit of this regression."""
     return [
         f"{segment.get('speaker')}|{segment.get('text')}"
         for segment in payload["segments"]
@@ -92,8 +98,13 @@ def test_moved_pipeline_matches_the_original_segments(tmp_path: Path) -> None:
     """Both wrappers drive the same moved pipeline over the same speech."""
     sample = _speech_sample(tmp_path)
 
-    moved = _run_pipeline(WRAPPER, sample, tmp_path / "moved")
-    frozen = _run_pipeline(SNAPSHOT, sample, tmp_path / "frozen")
+    moved_payload = _run_pipeline(WRAPPER, sample, tmp_path / "moved")
+    frozen_payload = _run_pipeline(SNAPSHOT, sample, tmp_path / "frozen")
 
+    moved = _segments(moved_payload)
     assert moved, "the sample must yield at least one segment to mean anything"
-    assert moved == frozen
+    assert moved == _segments(frozen_payload)
+    # The segments alone cannot see a model substitution: the requested model
+    # has to come back in each side's own metadata.
+    assert moved_payload["meta"]["model"] == MODEL
+    assert frozen_payload["meta"]["model"] == MODEL

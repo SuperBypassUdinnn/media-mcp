@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from mcp_types import ContentBlock, ImageContent, TextContent
 
-from media import server
+from media import media, server
 from tests import fixtures
 
 
@@ -81,6 +81,27 @@ def test_more_frames_than_the_inline_cap_are_capped_and_reported(source):
         f"(inline cap {server.INLINE_IMAGE_CAP})" in text
     )
     assert len(_png_paths(text)) == len(stamps)
+
+
+def test_a_per_tile_label_failure_reaches_the_status_block(source, monkeypatch):
+    # A degraded tile is never silent: the renderer's note travels into the
+    # response's `skipped:` line with the reason it fell back to unlabelled.
+    doomed = 1.0
+    real_label_tile = media._label_tile
+
+    def flaky(frame, timestamp, dimensions, family, font, scratch_dir=None):
+        if timestamp == doomed:
+            raise media.MediaError("label burn simulated failure")
+        return real_label_tile(frame, timestamp, dimensions, family, font, scratch_dir)
+
+    monkeypatch.setattr(media, "_label_tile", flaky)
+    result = asyncio.run(
+        server.media_frames(str(source), at=[0.5, 1.0, 1.5], tile="sheet")
+    )
+
+    assert isinstance(result, str)
+    assert "skipped:" in result, result
+    assert "label" in result.lower() and "simulated failure" in result, result
 
 
 def test_a_missing_png_degrades_to_its_path_and_says_so(source, monkeypatch):

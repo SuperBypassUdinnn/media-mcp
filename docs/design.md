@@ -291,6 +291,19 @@ eviction and avoids a corruption-prone state file. `last_used` is rewritten on
 every cache hit, which is what orders eviction; `created` is kept so an entry's
 age remains inspectable after repeated use.
 
+For a URL source, an entry exists because a download succeeded in it, or because
+a download is running in it right now: a download that fails removes the entry it
+created once nothing is left inside it, and never touches an entry that was
+already there. A failed download therefore cannot leave the `(unknown) | 0` line
+a directory scan would otherwise report, and a pre-existing entry is never
+deleted by a later failure. A local-file call that fails can still leave an entry
+directory with no artifacts in it, which the next call for the same source reuses
+rather than replacing.
+
+An entry directory that cannot be read, or a completed file that cannot be
+stat-ed, is named in a `MediaError` rather than treated as a cache miss — only a
+file that has genuinely vanished reads as a miss.
+
 ### 6.3 Timeline as text
 
 `timeline.md` is the human- and grep-friendly projection: one line per event

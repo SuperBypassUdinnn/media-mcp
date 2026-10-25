@@ -58,7 +58,10 @@ truncated stage is visible instead of silent.
 - Seven tools, all prefixed `media_`: `media_probe`, `media_manifest`,
   `media_frames`, `media_ocr`, `media_transcript`, `media_search`, `media_cache`.
 - The default `manifest` profile costs 1 to 3 KB; transcription is the heavy
-  stage and always opt-in.
+  stage and always opt-in. The first transcribed call is also the slow one: the
+  Hugging Face cache holds only `faster-whisper-tiny` (75 MB), and the pipeline's
+  default `large-v3-turbo` downloads roughly 1.6 GB, unless that model is
+  already cached or `model` is passed explicitly.
 - Sources are read-only. The server writes only inside its cache entry and never
   modifies, moves, or deletes a source file.
 - With `MEDIA_ALLOWED_READ_ROOTS` unset, any readable local path is accepted

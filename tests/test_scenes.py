@@ -7,6 +7,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from media import media
 from tests import fixtures
 
@@ -155,6 +157,45 @@ def test_diff_hash_downscales_through_ffmpeg(tmp_path):
     assert first == again
     assert 0 <= first < (1 << 64)
     assert media.hamming(first, media.diff_hash(late)) > 0
+
+
+def test_diff_hash_rejects_a_raster_that_is_not_the_documented_size(monkeypatch):
+    # ffmpeg hashes whatever gray raster it emitted; a future build that
+    # returns a different geometry must not be hashed silently, so the byte
+    # count is pinned to the documented 32x32x1 raster.
+    expected = media._GRAY_SIZE * media._GRAY_SIZE
+
+    def short_raster(*args, **kwargs):
+        return media.CompletedProcess(
+            returncode=0,
+            stdout="g" * (expected - 1),
+            stderr="",
+            timed_out=False,
+            killed=False,
+        )
+
+    monkeypatch.setattr(media, "run_child", short_raster)
+    with pytest.raises(media.MediaError) as err:
+        media.diff_hash(b"\x89PNG\r\n\x1a\n")
+    message = str(err.value)
+    assert str(expected - 1) in message, "the actual byte count must be named"
+    assert str(expected) in message, "the expected byte count must be named"
+
+
+def test_diff_hash_hashes_exactly_the_documented_raster(monkeypatch):
+    raster = bytes(range(256)) * (media._GRAY_SIZE * media._GRAY_SIZE // 256)
+
+    def full_raster(*args, **kwargs):
+        return media.CompletedProcess(
+            returncode=0,
+            stdout=raster.decode("latin-1"),
+            stderr="",
+            timed_out=False,
+            killed=False,
+        )
+
+    monkeypatch.setattr(media, "run_child", full_raster)
+    assert media.diff_hash(b"a frame") == media.diff_hash_of(raster)
 
 
 def test_run_child_stdin_bytes_reach_the_child_binary_safe():
