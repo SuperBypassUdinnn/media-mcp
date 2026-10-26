@@ -45,16 +45,16 @@ jobs:
 
       - name: Install the system tools the suite drives
         run: |
-          # ffmpeg and ffprobe are already part of the ubuntu-latest image; they
-          # are added to the list only when a leaner image ever omits them,
-          # because installing them pulls in most of the multimedia stack.
-          packages="tesseract-ocr tesseract-ocr-eng tesseract-ocr-ind espeak-ng fonts-dejavu-core fontconfig"
-          for tool in ffmpeg ffprobe tesseract espeak-ng; do
-            command -v "$tool" >/dev/null || packages="$packages $tool"
-          done
-          echo "installing: $packages"
+          # The suite drives these binaries directly, and the ubuntu-latest image
+          # carries none of them, so the list is fixed instead of probed: a
+          # tool name is not always a package name, and one wrong entry fails the
+          # whole install. ffprobe ships in ffmpeg, tesseract in tesseract-ocr.
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends $packages
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg \
+            tesseract-ocr tesseract-ocr-eng tesseract-ocr-ind \
+            espeak-ng \
+            fonts-dejavu-core fontconfig
 
       - name: System tool versions
         run: |
