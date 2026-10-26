@@ -6,15 +6,19 @@ on:
   pull_request:
   workflow_dispatch:
 
-# The suite runs the real tools the design depends on, so the runner installs
-# them instead of mocking them. The transcription pipeline (torch,
-# faster-whisper, pyannote: tens of gigabytes) is deliberately NOT built here:
-# the regression that drives it skips when transcribe/.venv is absent, which is
-# the same state as a fresh checkout.
+# The suite drives the real tools the design depends on, so the runner installs
+# them instead of mocking them. fc-match needs a monospace font for tile labels,
+# and the ingest tests invoke `yt-dlp` by name. The transcription pipeline
+# (torch, faster-whisper, pyannote: tens of gigabytes) is deliberately NOT built
+# here: the regression that drives it skips when transcribe/.venv is absent,
+# which is also the state of a fresh checkout.
+#
+# Static checks run before the system packages, so a lint failure reports in
+# about a minute instead of queueing behind an apt install.
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -24,15 +28,6 @@ jobs:
           version: "0.11.21"
           enable-cache: true
 
-      - name: Install the system tools the tests drive
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            ffmpeg \
-            tesseract-ocr tesseract-ocr-eng tesseract-ocr-ind \
-            espeak-ng \
-            fonts-dejavu-core fontconfig
-
       - name: Build the server virtualenv from the pinned manifest
         run: |
           uv venv media/.venv --python 3.14
@@ -41,14 +36,32 @@ jobs:
           uv pip install --python media/.venv/bin/python yt-dlp
 
       - name: Put the virtualenv on PATH
-        # The ingest tests invoke `yt-dlp` by name; pinning it in the venv keeps
-        # the version under the manifest's control instead of the runner's.
         run: echo "$PWD/media/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Static checks
         run: |
           media/.venv/bin/python -m ruff check .
           media/.venv/bin/python -m ruff format --check .
+
+      - name: Install the system tools the suite drives
+        run: |
+          # ffmpeg and ffprobe are already part of the ubuntu-latest image; they
+          # are added to the list only when a leaner image ever omits them,
+          # because installing them pulls in most of the multimedia stack.
+          packages="tesseract-ocr tesseract-ocr-eng tesseract-ocr-ind espeak-ng fonts-dejavu-core fontconfig"
+          for tool in ffmpeg ffprobe tesseract espeak-ng; do
+            command -v "$tool" >/dev/null || packages="$packages $tool"
+          done
+          echo "installing: $packages"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $packages
+
+      - name: System tool versions
+        run: |
+          ffmpeg -version | head -1
+          tesseract --version | head -1
+          espeak-ng --version | head -1
+          fc-match monospace
 
       - name: Test suite
         run: media/.venv/bin/python -m pytest -q
