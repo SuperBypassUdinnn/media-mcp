@@ -9,6 +9,7 @@ the real blur/brightness/contrast math without touching ffmpeg or the network.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import media.server
@@ -64,6 +65,7 @@ def test_image_stats_keys_and_ranges(tmp_path):
     assert 0 <= metrics["brightness"] <= 255
     assert 0 <= metrics["contrast"] <= 255
     assert len(metrics["channels"]) == 3
+    assert "brisque_score" in metrics
 
 
 def test_blurred_image_has_lower_blur_score(tmp_path):
@@ -98,12 +100,101 @@ def _tier_of(result: str) -> str:
 
 
 def test_quality_tier_classification():
-    assert media_mod.quality_tier({"blur_score": 10.0, "brightness": 100.0}) == "poor"
-    assert media_mod.quality_tier({"blur_score": 10.0, "brightness": 240.0}) == "poor"
-    assert media_mod.quality_tier({"blur_score": 10.0, "brightness": 20.0}) == "poor"
-    assert media_mod.quality_tier({"blur_score": 600.0, "brightness": 120.0}) == "good"
-    assert media_mod.quality_tier({"blur_score": 300.0, "brightness": 120.0}) == "fair"
-    assert media_mod.quality_tier({"blur_score": 600.0, "brightness": 20.0}) == "poor"
+    # Blur poor drives overall poor regardless of other metrics.
+    assert (
+        media_mod.quality_tier(
+            {"blur_score": 10.0, "brightness": 100.0, "contrast": 50.0}
+        )
+        == "poor"
+    )
+    # Brightness extreme drives overall poor.
+    assert (
+        media_mod.quality_tier(
+            {"blur_score": 600.0, "brightness": 240.0, "contrast": 50.0}
+        )
+        == "poor"
+    )
+    assert (
+        media_mod.quality_tier(
+            {"blur_score": 600.0, "brightness": 20.0, "contrast": 50.0}
+        )
+        == "poor"
+    )
+    # Contrast extreme drives overall poor.
+    assert (
+        media_mod.quality_tier(
+            {"blur_score": 600.0, "brightness": 120.0, "contrast": 10.0}
+        )
+        == "poor"
+    )
+    assert (
+        media_mod.quality_tier(
+            {"blur_score": 600.0, "brightness": 120.0, "contrast": 90.0}
+        )
+        == "poor"
+    )
+    # BRISQUE poor drives overall worst-wins tier.
+    assert (
+        media_mod.quality_tier(
+            {
+                "blur_score": 600.0,
+                "brightness": 120.0,
+                "contrast": 50.0,
+                "brisque_score": 60.0,
+            }
+        )
+        == "poor"
+    )
+    # All metrics good => overall good.
+    assert (
+        media_mod.quality_tier(
+            {"blur_score": 600.0, "brightness": 120.0, "contrast": 50.0}
+        )
+        == "good"
+    )
+    # All metrics fair => overall fair.
+    assert (
+        media_mod.quality_tier(
+            {"blur_score": 300.0, "brightness": 120.0, "contrast": 50.0}
+        )
+        == "fair"
+    )
+    # Missing brisque_score is excluded from worst-wins, not penalized.
+    assert (
+        media_mod.quality_tier(
+            {
+                "blur_score": 600.0,
+                "brightness": 120.0,
+                "contrast": 50.0,
+                "brisque_score": None,
+            }
+        )
+        == "good"
+    )
+    # BRISQUE good (<25) contributes good tier.
+    assert (
+        media_mod.quality_tier(
+            {
+                "blur_score": 600.0,
+                "brightness": 120.0,
+                "contrast": 50.0,
+                "brisque_score": 10.0,
+            }
+        )
+        == "good"
+    )
+    # BRISQUE fair (25-50) contributes fair tier.
+    assert (
+        media_mod.quality_tier(
+            {
+                "blur_score": 600.0,
+                "brightness": 120.0,
+                "contrast": 50.0,
+                "brisque_score": 35.0,
+            }
+        )
+        == "fair"
+    )
 
 
 def test_media_image_quality(tmp_path, monkeypatch):
@@ -122,11 +213,39 @@ def test_media_image_quality(tmp_path, monkeypatch):
     assert "skipped:" in result
     # The tier artifact was written to the cache entry.
     quality_json = next(cache.rglob("quality.json"))
-    import json
-
     payload = json.loads(quality_json.read_text())
     assert payload["tier"] in {"poor", "fair", "good"}
     assert payload["source"] == str(path)
+    assert "brisque_score" in payload["metrics"]
+    # BRISQUE scoring may fail on some images (package/numpy compatibility);
+    # when it succeeds, the score line appears in the output.
+    if payload["metrics"]["brisque_score"] is not None:
+        assert "BRISQUE score (lower is better):" in result
+
+
+def test_media_image_quality_flag_poor(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("MEDIA_CACHE_DIR", str(cache))
+    path = tmp_path / "blurry.png"
+    _write_blurred_png(path, 300, 300)
+    # flag_poor=True should append FLAG: POOR when the tier is poor.
+    result_flagged = asyncio.run(
+        media.server.media_image_quality(str(path), flag_poor=True)
+    )
+    assert "FLAG: POOR" in result_flagged, result_flagged
+    # Default (flag_poor=False) should not append FLAG: POOR.
+    result_plain = asyncio.run(media.server.media_image_quality(str(path)))
+    assert "FLAG: POOR" not in result_plain, result_plain
+
+
+def test_brisque_score_degrades_gracefully():
+    """_brisque_score returns None or a float when scoring an image."""
+    import numpy as np
+
+    img = np.full((100, 100, 3), 128, dtype=np.uint8)
+    score = media_mod._brisque_score(img)
+    assert score is None or isinstance(score, float)
 
 
 def test_media_image_sort_keps_best_first(tmp_path, monkeypatch):

@@ -2419,10 +2419,14 @@ async def media_search(
     )
 
 
-async def media_image_quality(source: str, identity: str = "sampled") -> str:
+async def media_image_quality(
+    source: str, identity: str = "sampled", flag_poor: bool = False
+) -> str:
     """Assess one image's quality: blur, brightness, contrast, resolution, tier."""
     return await _guarded(
-        lambda cancel: _quality_work(load_settings(), source, identity, cancel)
+        lambda cancel: _quality_work(
+            load_settings(), source, identity, cancel, flag_poor
+        )
     )
 
 
@@ -2453,6 +2457,7 @@ def _quality_work(
     source: str,
     identity: str,
     cancel: threading.Event,
+    flag_poor: bool = False,
 ) -> str:
     report = _Report()
     resolved, path, entry, identity_note = _entry_for(
@@ -2479,12 +2484,21 @@ def _quality_work(
         f"Brightness (mean gray): {metrics['brightness']}",
         f"Contrast (gray std): {metrics['contrast']}",
         f"Channel means (BGR): {metrics['channels']}",
+    ]
+    if metrics.get("brisque_score") is not None:
+        lines.append(f"BRISQUE score (lower is better): {metrics['brisque_score']}")
+    lines += [
         "",
         (
             "Interpretation: blur below 100 is likely out of focus; brightness "
-            "below 30 is underexposed, above 220 overexposed; ``good`` needs "
-            "blur >= 500 and brightness 60-220."
+            "below 40 or above 210 is extreme; contrast std below 25 or above "
+            "75 is flat or harsh; BRISQUE below 25 is good, above 50 is poor. "
+            "Overall tier is the worst of all metrics (worst wins)."
         ),
+    ]
+    if flag_poor and tier == "poor":
+        lines.append("FLAG: POOR")
+    lines += [
         "",
         report.status(),
     ]
@@ -2619,10 +2633,12 @@ _TOOL_DESCRIPTIONS = {
     ),
     "media_image_quality": (
         "Assess one image's quality: blur score (Laplacian variance), brightness, "
-        "contrast, resolution, format, size, and a ``poor``/``fair``/``good`` tier. "
+        "contrast, resolution, format, size, BRISQUE NR-IQA score, and a "
+        "``poor``/``fair``/``good`` tier (worst of all metrics wins). "
         "`source` is an absolute local path or an http/https media URL, downloaded "
-        "into the cache with yt-dlp when needed. Caches quality.json in the source's "
-        "entry. Use it to pick which photos in a series are worth keeping."
+        "into the cache with yt-dlp when needed. `flag_poor=true` appends a "
+        "``FLAG: POOR`` line when the tier is ``poor``. Caches quality.json in the "
+        "source's entry. Use it to pick which photos in a series are worth keeping."
     ),
     "media_image_sort": (
         "Rank a list of images by a quality metric, with optional filtering. "

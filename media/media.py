@@ -57,6 +57,13 @@ try:
 except ImportError:  # cv2 is optional; media_image_quality names it when missing
     cv2 = None
 
+try:
+    import brisque as _brisque_pkg
+except ImportError:  # brisque is optional; media_image_quality names it when missing
+    _brisque_pkg = None
+
+_brisque_model = None  # lazy singleton; BRISQUE() loads the NR-IQA model once
+
 _PayloadT_co = TypeVar("_PayloadT_co", covariant=True)
 
 # The refusal thresholds of the design document, exposed here as plain module
@@ -66,12 +73,20 @@ MEDIA_MAX_SOURCE_BYTES = 4 * 1024**3
 MEDIA_MAX_SOURCE_SECONDS = 14400.0
 
 # Image quality thresholds for photo review/sorting.
+# These are the defaults agreed in the grill-me session; they can be overridden
+# by editing these constants or by passing different values per call in future.
 _BLUR_POOR = 100.0  # Laplacian variance below this is likely out of focus
 _BLUR_GOOD = 500.0  # at or above this is acceptably sharp
-_BRIGHT_DARK = 30.0  # mean gray below this is underexposed
-_BRIGHT_BRIGHT = 220.0  # mean gray above this is overexposed
-_BRIGHT_MIN = 60.0  # ``good`` needs brightness at least this high
-_BRIGHT_MAX = 200.0  # ``good`` needs brightness at most this high
+_BRIGHT_DARK = 40.0  # mean gray below this is underexposed
+_BRIGHT_BRIGHT = 210.0  # mean gray above this is overexposed
+_BRIGHT_GOOD_MIN = 60.0  # good needs brightness at least this high
+_BRIGHT_GOOD_MAX = 200.0  # good needs brightness at most this high
+_CONTRAST_POOR_LOW = 25.0  # gray std below this is flat/low contrast
+_CONTRAST_POOR_HIGH = 75.0  # gray std above this is harsh/high contrast
+_CONTRAST_GOOD_MIN = 30.0  # good needs contrast at least this high
+_CONTRAST_GOOD_MAX = 70.0  # good needs contrast at most this high
+_BRISQUE_GOOD = 25.0  # BRISQUE score below this is good
+_BRISQUE_POOR = 50.0  # BRISQUE score above this is poor
 
 # The warning threshold: half of each hard cap (2 GiB, 2 hours).
 _WARN_FRACTION = 0.5
@@ -2464,9 +2479,10 @@ def _image_stats(path: Path) -> dict[str, object]:
     """Compute quality metrics for one image file.
 
     Uses OpenCV's Laplacian variance as a model-free proxy for focus (blur)
-    quality, and plain grayscale statistics for brightness and contrast.
-    Returns a plain dict consumable by both the server text renderer and
-    unit tests without the MCP transport.
+    quality, plain grayscale statistics for brightness and contrast, and the
+    BRISQUE no-reference IQA score (lower = better). Returns a plain dict
+    consumable by both the server text renderer and unit tests without the MCP
+    transport.
     """
     if cv2 is None:
         raise MediaError(
@@ -2489,6 +2505,7 @@ def _image_stats(path: Path) -> dict[str, object]:
     contrast = float(gray.std())
     size_bytes = path.stat().st_size if path.is_file() else 0
     fmt = path.suffix.lstrip(".").upper() or "(unknown)"
+    brisque_score = _brisque_score(img)
     return {
         "width": int(width),
         "height": int(height),
@@ -2499,20 +2516,92 @@ def _image_stats(path: Path) -> dict[str, object]:
         "brightness": round(brightness, 2),
         "contrast": round(contrast, 2),
         "channels": [round(m, 2) for m in means],
+        "brisque_score": brisque_score,
     }
+
+
+def _brisque_score(img) -> float | None:
+    """Compute the BRISQUE no-reference IQA score for an image array.
+
+    Returns ``None`` when the `brisque` package is not installed or scoring
+    fails, so the caller can degrade gracefully. The BRISQUE model is loaded
+    once and reused across calls.
+    """
+    global _brisque_model
+    if _brisque_pkg is None:
+        return None
+    if _brisque_model is None:
+        _brisque_model = _brisque_pkg.BRISQUE()
+    score = None
+    try:
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        score = _brisque_model.score(rgb)
+        return float(score)
+    except (TypeError, ValueError):
+        # `score` may return a numpy array or scalar; convert defensively.
+        try:
+            import numpy as np
+
+            arr = np.asarray(score)
+            return float(arr.item()) if arr.ndim == 0 else None
+        except (TypeError, ValueError):
+            return None
+    except cv2.error:
+        return None
+
+
+def _blur_tier(blur: float) -> str:
+    if blur < _BLUR_POOR:
+        return "poor"
+    if blur >= _BLUR_GOOD:
+        return "good"
+    return "fair"
+
+
+def _brightness_tier(brightness: float) -> str:
+    if brightness < _BRIGHT_DARK or brightness > _BRIGHT_BRIGHT:
+        return "poor"
+    if _BRIGHT_GOOD_MIN <= brightness <= _BRIGHT_GOOD_MAX:
+        return "good"
+    return "fair"
+
+
+def _contrast_tier(contrast: float) -> str:
+    if contrast < _CONTRAST_POOR_LOW or contrast > _CONTRAST_POOR_HIGH:
+        return "poor"
+    if _CONTRAST_GOOD_MIN <= contrast <= _CONTRAST_GOOD_MAX:
+        return "good"
+    return "fair"
+
+
+def _brisque_tier(score: float | None) -> str:
+    if score is None:
+        return "fair"  # cannot assess, treat as neutral
+    if score > _BRISQUE_POOR:
+        return "poor"
+    if score < _BRISQUE_GOOD:
+        return "good"
+    return "fair"
+
+
+_TIER_RANK = {"poor": 0, "fair": 1, "good": 2}
 
 
 def quality_tier(metrics: dict[str, object]) -> str:
     """Classify one image's quality into ``poor``, ``fair``, or ``good``.
 
-    ``poor`` when focus or exposure is clearly bad (blurry, too dark, or
-    too bright); ``good`` when both focus and exposure are in a usable
-    range; ``fair`` otherwise.
+    Each metric (blur, brightness, contrast, BRISQUE) is classified
+    independently and the overall tier is the worst of them ("worst wins").
+    ``poor`` when any metric is clearly bad; ``good`` when every metric is in
+    a usable range; ``fair`` otherwise. A metric that cannot be measured
+    (e.g. BRISQUE when the package is missing) is excluded from the worst-wins
+    comparison rather than penalizing the image.
     """
-    blur = float(metrics["blur_score"])
-    brightness = float(metrics["brightness"])
-    if blur < _BLUR_POOR or brightness < _BRIGHT_DARK or brightness > _BRIGHT_BRIGHT:
-        return "poor"
-    if blur >= _BLUR_GOOD and _BRIGHT_MIN <= brightness <= _BRIGHT_MAX:
-        return "good"
-    return "fair"
+    tiers = [
+        _blur_tier(float(metrics["blur_score"])),
+        _brightness_tier(float(metrics["brightness"])),
+        _contrast_tier(float(metrics["contrast"])),
+    ]
+    if metrics.get("brisque_score") is not None:
+        tiers.append(_brisque_tier(metrics["brisque_score"]))
+    return min(tiers, key=lambda t: _TIER_RANK[t])
