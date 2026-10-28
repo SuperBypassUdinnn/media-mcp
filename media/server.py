@@ -49,7 +49,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ContentBlock, ImageContent, TextContent
 
 from media import artifacts, contracts, ingest, media
-from media.media import MediaError
+from media.media import MediaError, _image_stats, quality_tier
 
 # The shared parameter ceilings of the design document. `count` and `fps` and
 # `k` are hard caps; `timeout` has a default and a ceiling. The frame budget
@@ -2419,6 +2419,153 @@ async def media_search(
     )
 
 
+async def media_image_quality(source: str, identity: str = "sampled") -> str:
+    """Assess one image's quality: blur, brightness, contrast, resolution, tier."""
+    return await _guarded(
+        lambda cancel: _quality_work(load_settings(), source, identity, cancel)
+    )
+
+
+async def media_image_sort(
+    sources: list,
+    by: str = "quality",
+    order: str = "desc",
+    min_quality: str | None = None,
+    identity: str = "sampled",
+) -> str:
+    """Rank a list of images by a quality metric, with optional filtering."""
+    return await _guarded(
+        lambda cancel: _sort_work(
+            load_settings(), sources, by, order, min_quality, identity, cancel
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Photo review/sorting work functions. These sit in the server layer because
+# they need the entry-resolution, report, and validation helpers that live
+# here; the pure image statistics they consume live in media/media.py.
+# ---------------------------------------------------------------------------
+
+
+def _quality_work(
+    settings: Settings,
+    source: str,
+    identity: str,
+    cancel: threading.Event,
+) -> str:
+    report = _Report()
+    resolved, path, entry, identity_note = _entry_for(
+        settings, source, identity, report
+    )
+    _record_identity_note(report, identity_note)
+    metrics = _image_stats(path)
+    tier = quality_tier(metrics)
+    _write_json(
+        entry / "quality.json",
+        {"metrics": metrics, "tier": tier, "source": resolved.source},
+    )
+    _record_entry(entry, resolved)
+    lines = [
+        "# media_image_quality",
+        "",
+        f"Source: {resolved.source}",
+        f"Identity: {resolved.kind} {resolved.key}",
+        f"Quality tier: {tier}",
+        "",
+        f"Resolution: {metrics['width']}x{metrics['height']} ({metrics['resolution']:,} px)",
+        f"Format: {metrics['format']}  Size: {metrics['size_bytes']:,} bytes",
+        f"Blur score (Laplacian variance): {metrics['blur_score']}",
+        f"Brightness (mean gray): {metrics['brightness']}",
+        f"Contrast (gray std): {metrics['contrast']}",
+        f"Channel means (BGR): {metrics['channels']}",
+        "",
+        (
+            "Interpretation: blur below 100 is likely out of focus; brightness "
+            "below 30 is underexposed, above 220 overexposed; ``good`` needs "
+            "blur >= 500 and brightness 60-220."
+        ),
+        "",
+        report.status(),
+    ]
+    return "\n".join(lines)
+
+
+def _sort_work(
+    settings: Settings,
+    sources: list,
+    by: str,
+    order: str,
+    min_quality: str | None,
+    identity: str,
+    cancel: threading.Event,
+) -> str:
+    """Rank a list of images by a quality metric, with optional filtering."""
+    report = _Report()
+    BY_ALLOWED = ("blur", "brightness", "contrast", "size", "resolution", "quality")
+    by = validate_choice(by, "quality", BY_ALLOWED, "by")
+    order = validate_choice(order, "desc", ("asc", "desc"), "order")
+    TIER_ORDER = {"poor": 0, "fair": 1, "good": 2}
+    min_tier = None
+    if min_quality is not None:
+        min_tier = validate_choice(
+            min_quality, None, ("poor", "fair", "good"), "min_quality"
+        )
+        min_tier = TIER_ORDER[min_tier]
+
+    results: list[dict[str, object]] = []
+    for source in sources:
+        resolved, path, _entry, note = _entry_for(settings, source, identity, report)
+        _record_identity_note(report, note)
+        metrics = _image_stats(path)
+        tier = quality_tier(metrics)
+        results.append(
+            {
+                "source": resolved.source,
+                "key": resolved.key,
+                "tier": tier,
+                "tier_rank": TIER_ORDER[tier],
+                "metrics": metrics,
+            }
+        )
+
+    kept = [r for r in results if min_tier is None or r["tier_rank"] >= min_tier]
+    if len(kept) < len(results):
+        report.skipped["filter"] = (
+            f"removed {len(results) - len(kept)} below min_quality={min_quality}"
+        )
+
+    if by == "quality":
+        keyfn = lambda r: (r["tier_rank"], r["metrics"]["blur_score"])
+    elif by == "blur":
+        keyfn = lambda r: r["metrics"]["blur_score"]
+    elif by == "brightness":
+        keyfn = lambda r: r["metrics"]["brightness"]
+    elif by == "contrast":
+        keyfn = lambda r: r["metrics"]["contrast"]
+    elif by == "size":
+        keyfn = lambda r: r["metrics"]["size_bytes"]
+    else:  # by == "resolution"
+        keyfn = lambda r: r["metrics"]["resolution"]
+    kept.sort(key=keyfn, reverse=(order == "desc"))
+
+    lines = ["# media_image_sort", "", f"Sort: by={by} order={order}"]
+    if min_quality:
+        lines.append(f"Min quality: {min_quality}")
+    lines.append(f"Kept: {len(kept)} of {len(results)}")
+    lines.append("")
+    for i, r in enumerate(kept, 1):
+        m = r["metrics"]
+        lines.append(
+            f"{i}. {r['source']}  [{r['tier']}] "
+            f"blur={m['blur_score']} brightness={m['brightness']} "
+            f"contrast={m['contrast']} {m['width']}x{m['height']}"
+        )
+    lines.append("")
+    lines.append(report.status())
+    return "\n".join(lines)
+
+
 async def media_cache(action: str = "list") -> str:
     """Report the artifact cache: entries, cap, dependencies, eviction."""
     return await _guarded(lambda cancel: _cache_work(load_settings(), action, cancel))
@@ -2470,6 +2617,21 @@ _TOOL_DESCRIPTIONS = {
         "hits. Run media_transcript or media_ocr first so there is something to "
         "search."
     ),
+    "media_image_quality": (
+        "Assess one image's quality: blur score (Laplacian variance), brightness, "
+        "contrast, resolution, format, size, and a ``poor``/``fair``/``good`` tier. "
+        "`source` is an absolute local path or an http/https media URL, downloaded "
+        "into the cache with yt-dlp when needed. Caches quality.json in the source's "
+        "entry. Use it to pick which photos in a series are worth keeping."
+    ),
+    "media_image_sort": (
+        "Rank a list of images by a quality metric, with optional filtering. "
+        "`sources` is a list of local paths or http/https media URLs. `by` picks "
+        "blur, brightness, contrast, size, resolution, or ``quality`` (the tier "
+        "plus blur as tie-break, default); `order` is ``desc`` or ``asc``; "
+        "`min_quality`` (``poor``/``fair``/``good``) drops everything below it. "
+        "Returns the kept images ranked, so you can quickly discard bad photos."
+    ),
     "media_cache": (
         "Report the artifact cache: `list` shows the entry table, `stats` shows "
         "total_bytes against the cap plus the transcription dependency self-check, "
@@ -2495,6 +2657,8 @@ def build_server() -> MCPServer:
         media_ocr,
         media_transcript,
         media_search,
+        media_image_quality,
+        media_image_sort,
         media_cache,
     ):
         server.tool(

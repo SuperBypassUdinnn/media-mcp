@@ -1,0 +1,171 @@
+"""Tests for photo review/sorting: ``media_image_quality`` and
+``media_image_sort``.
+
+Images are synthesized with OpenCV (available in the server virtualenv) and
+analyzed with the same pure functions the server uses, so the tests exercise
+the real blur/brightness/contrast math without touching ffmpeg or the network.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import media.server
+from media import media as media_mod
+
+
+def _write_png(
+    path: Path, width: int, height: int, color: tuple[int, int, int]
+) -> None:
+    """Write a solid-color PNG with OpenCV (BGR)."""
+    import numpy as np
+
+    img = np.full((height, width, 3), color, dtype=np.uint8)
+    cv2 = __import__("cv2")
+    cv2.imwrite(str(path), img)
+
+
+def _write_blurred_png(path: Path, width: int, height: int) -> None:
+    """Write an out-of-focus image: solid color then a Gaussian blur."""
+    import numpy as np
+
+    cv2 = __import__("cv2")
+    img = np.full((height, width, 3), (120, 140, 160), dtype=np.uint8)
+    # Some structure so it is not perfectly flat, then blur it heavily.
+    cv2.rectangle(
+        img,
+        (width // 4, height // 4),
+        (3 * width // 4, 3 * height // 4),
+        (40, 60, 80),
+        -1,
+    )
+    cv2.GaussianBlur(img, (31, 31), 0, img)
+    cv2.imwrite(str(path), img)
+
+
+def _tier_of(result: str) -> str:
+    for line in result.splitlines():
+        if line.startswith("Quality tier:"):
+            return line.split(":", 1)[1].strip()
+    raise AssertionError(f"no Quality tier line in:\n{result}")
+
+
+def test_image_stats_keys_and_ranges(tmp_path):
+    path = tmp_path / "sharp.png"
+    _write_png(path, 400, 300, (10, 200, 50))
+    metrics = media_mod._image_stats(path)
+    assert metrics["width"] == 400
+    assert metrics["height"] == 300
+    assert metrics["resolution"] == 120000
+    assert metrics["format"] == "PNG"
+    assert metrics["size_bytes"] > 0
+    assert metrics["blur_score"] >= 0
+    assert 0 <= metrics["brightness"] <= 255
+    assert 0 <= metrics["contrast"] <= 255
+    assert len(metrics["channels"]) == 3
+
+
+def test_blurred_image_has_lower_blur_score(tmp_path):
+    sharp = tmp_path / "sharp.png"
+    blurred = tmp_path / "blurred.png"
+    _write_checkerboard(sharp, 300, 300)
+    _write_blurred_png(blurred, 300, 300)
+    sharp_metrics = media_mod._image_stats(sharp)
+    blurred_metrics = media_mod._image_stats(blurred)
+    assert sharp_metrics["blur_score"] > blurred_metrics["blur_score"]
+
+
+def _write_checkerboard(path: Path, width: int, height: int) -> None:
+    """High-frequency pattern so the Laplacian blur score is clearly positive."""
+    import numpy as np
+
+    cv2 = __import__("cv2")
+    tile = 20
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    for y in range(0, height, tile):
+        for x in range(0, width, tile):
+            if ((x // tile) + (y // tile)) % 2 == 0:
+                img[y : y + tile, x : x + tile] = (200, 200, 200)
+    cv2.imwrite(str(path), img)
+
+
+def _tier_of(result: str) -> str:
+    for line in result.splitlines():
+        if line.startswith("Quality tier:"):
+            return line.split(":", 1)[1].strip()
+    raise AssertionError(f"no Quality tier line in:\n{result}")
+
+
+def test_quality_tier_classification():
+    assert media_mod.quality_tier({"blur_score": 10.0, "brightness": 100.0}) == "poor"
+    assert media_mod.quality_tier({"blur_score": 10.0, "brightness": 240.0}) == "poor"
+    assert media_mod.quality_tier({"blur_score": 10.0, "brightness": 20.0}) == "poor"
+    assert media_mod.quality_tier({"blur_score": 600.0, "brightness": 120.0}) == "good"
+    assert media_mod.quality_tier({"blur_score": 300.0, "brightness": 120.0}) == "fair"
+    assert media_mod.quality_tier({"blur_score": 600.0, "brightness": 20.0}) == "poor"
+
+
+def test_media_image_quality(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("MEDIA_CACHE_DIR", str(cache))
+    path = tmp_path / "photo.png"
+    _write_png(path, 640, 480, (30, 180, 90))
+    result = asyncio.run(media.server.media_image_quality(str(path)))
+    assert "# media_image_quality" in result
+    assert f"Source: {path}" in result
+    assert "Resolution: 640x480" in result
+    assert "Quality tier:" in result
+    assert "Blur score (Laplacian variance):" in result
+    assert "Format: PNG" in result
+    assert "skipped:" in result
+    # The tier artifact was written to the cache entry.
+    quality_json = next(cache.rglob("quality.json"))
+    import json
+
+    payload = json.loads(quality_json.read_text())
+    assert payload["tier"] in {"poor", "fair", "good"}
+    assert payload["source"] == str(path)
+
+
+def test_media_image_sort_keps_best_first(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("MEDIA_CACHE_DIR", str(cache))
+    sharp = tmp_path / "sharp.png"
+    blurred = tmp_path / "blurred.png"
+    _write_checkerboard(sharp, 300, 300)
+    _write_blurred_png(blurred, 300, 300)
+    result = asyncio.run(
+        media.server.media_image_sort(
+            [str(sharp), str(blurred)], by="blur", order="desc"
+        )
+    )
+    items = [
+        line
+        for line in result.splitlines()
+        if line.strip() and line[0].isdigit() and ". " in line
+    ]
+    # First kept image should be the sharp one (higher blur score).
+    assert str(sharp) in items[0], items
+    assert str(blurred) in items[1], items
+    assert "Kept: 2 of 2" in result
+
+
+def test_media_image_sort_filters_by_min_quality(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("MEDIA_CACHE_DIR", str(cache))
+    sharp = tmp_path / "sharp.png"
+    blurred = tmp_path / "blurred.png"
+    _write_checkerboard(sharp, 300, 300)
+    _write_blurred_png(blurred, 300, 300)
+    result = asyncio.run(
+        media.server.media_image_sort(
+            [str(sharp), str(blurred)], by="quality", order="desc", min_quality="good"
+        )
+    )
+    assert "Kept:" in result
+    # The blurred image is poor and should be filtered out by min_quality=good.
+    assert str(blurred) not in result, result

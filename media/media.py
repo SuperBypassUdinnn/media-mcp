@@ -52,6 +52,11 @@ from typing import BinaryIO, Generic, TypeVar
 
 from media.artifacts import format_timestamp
 
+try:
+    import cv2
+except ImportError:  # cv2 is optional; media_image_quality names it when missing
+    cv2 = None
+
 _PayloadT_co = TypeVar("_PayloadT_co", covariant=True)
 
 # The refusal thresholds of the design document, exposed here as plain module
@@ -59,6 +64,14 @@ _PayloadT_co = TypeVar("_PayloadT_co", covariant=True)
 # `MEDIA_MAX_SOURCE_BYTES` and `MEDIA_MAX_SOURCE_SECONDS` variables over these.
 MEDIA_MAX_SOURCE_BYTES = 4 * 1024**3
 MEDIA_MAX_SOURCE_SECONDS = 14400.0
+
+# Image quality thresholds for photo review/sorting.
+_BLUR_POOR = 100.0  # Laplacian variance below this is likely out of focus
+_BLUR_GOOD = 500.0  # at or above this is acceptably sharp
+_BRIGHT_DARK = 30.0  # mean gray below this is underexposed
+_BRIGHT_BRIGHT = 220.0  # mean gray above this is overexposed
+_BRIGHT_MIN = 60.0  # ``good`` needs brightness at least this high
+_BRIGHT_MAX = 200.0  # ``good`` needs brightness at most this high
 
 # The warning threshold: half of each hard cap (2 GiB, 2 hours).
 _WARN_FRACTION = 0.5
@@ -2445,3 +2458,61 @@ def _parse_tesseract_tsv(tsv: str) -> tuple[str, float]:
     text = "\n".join(" ".join(words) for words in words_by_line.values())
     mean = sum(confidences) / len(confidences) / 100.0 if confidences else 0.0
     return text, mean
+
+
+def _image_stats(path: Path) -> dict[str, object]:
+    """Compute quality metrics for one image file.
+
+    Uses OpenCV's Laplacian variance as a model-free proxy for focus (blur)
+    quality, and plain grayscale statistics for brightness and contrast.
+    Returns a plain dict consumable by both the server text renderer and
+    unit tests without the MCP transport.
+    """
+    if cv2 is None:
+        raise MediaError(
+            "media_image_quality needs opencv-python-headless (cv2); install "
+            "it into the server virtualenv, e.g. `uv pip install --python "
+            "media/.venv/bin/python opencv-python-headless`"
+        )
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img is None:
+        raise MediaError(f"could not decode image {path}; not an image cv2 reads")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    height, width = gray.shape
+    channels = img.shape[2] if img.ndim == 3 else 1
+    if channels == 3:
+        means = [float(img[:, :, c].mean()) for c in range(3)]
+    else:
+        means = [float(gray.mean())]
+    brightness = float(gray.mean())
+    contrast = float(gray.std())
+    size_bytes = path.stat().st_size if path.is_file() else 0
+    fmt = path.suffix.lstrip(".").upper() or "(unknown)"
+    return {
+        "width": int(width),
+        "height": int(height),
+        "resolution": int(width * height),
+        "format": fmt,
+        "size_bytes": int(size_bytes),
+        "blur_score": round(blur, 2),
+        "brightness": round(brightness, 2),
+        "contrast": round(contrast, 2),
+        "channels": [round(m, 2) for m in means],
+    }
+
+
+def quality_tier(metrics: dict[str, object]) -> str:
+    """Classify one image's quality into ``poor``, ``fair``, or ``good``.
+
+    ``poor`` when focus or exposure is clearly bad (blurry, too dark, or
+    too bright); ``good`` when both focus and exposure are in a usable
+    range; ``fair`` otherwise.
+    """
+    blur = float(metrics["blur_score"])
+    brightness = float(metrics["brightness"])
+    if blur < _BLUR_POOR or brightness < _BRIGHT_DARK or brightness > _BRIGHT_BRIGHT:
+        return "poor"
+    if blur >= _BLUR_GOOD and _BRIGHT_MIN <= brightness <= _BRIGHT_MAX:
+        return "good"
+    return "fair"

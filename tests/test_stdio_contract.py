@@ -46,6 +46,8 @@ TOOL_NAMES = {
     "media_ocr",
     "media_transcript",
     "media_search",
+    "media_image_quality",
+    "media_image_sort",
     "media_cache",
 }
 
