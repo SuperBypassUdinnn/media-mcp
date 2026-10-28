@@ -43,6 +43,15 @@ jobs:
           media/.venv/bin/python -m ruff check .
           media/.venv/bin/python -m ruff format --check .
 
+      - name: Cache APT package archives
+        uses: actions/cache@v4
+        with:
+          # Holds the .deb files apt-get install downloads. On a cache hit the
+          # install skips the network download (apt-get update still runs to
+          # refresh indexes, which is fast). Bump v2 when the package list changes.
+          path: /var/cache/apt/archives
+          key: apt-packages-v2-${{ runner.os }}
+
       - name: Install the system tools the suite drives
         run: |
           # The suite drives these binaries directly, and the ubuntu-latest image
