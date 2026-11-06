@@ -11,7 +11,9 @@ on:
 # and the ingest tests invoke `yt-dlp` by name. The transcription pipeline
 # (torch, faster-whisper, pyannote: tens of gigabytes) is deliberately NOT built
 # here: the regression that drives it skips when transcribe/.venv is absent,
-# which is also the state of a fresh checkout.
+# which is also the state of a fresh checkout. The rhythm pipeline (librosa in
+# rhythm/.venv, ~300 MB of wheels) IS built from its pinned manifest, so the
+# beat tests exercise the real librosa engine rather than only the fallback.
 #
 # Static checks run before the system packages, so a lint failure reports in
 # about a minute instead of queueing behind an apt install.
@@ -34,6 +36,11 @@ jobs:
           uv pip install --python media/.venv/bin/python -r media/requirements.txt
           # The ingest tests exercise the real downloader by name.
           uv pip install --python media/.venv/bin/python yt-dlp
+
+      - name: Build the rhythm virtualenv from the pinned manifest
+        run: |
+          uv venv rhythm/.venv --python 3.12
+          uv pip install --python rhythm/.venv/bin/python -r rhythm/requirements.txt
 
       - name: Put the virtualenv on PATH
         run: echo "$PWD/media/.venv/bin" >> "$GITHUB_PATH"
