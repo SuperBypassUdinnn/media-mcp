@@ -1,8 +1,8 @@
 # Design: Motion Analysis and Audio-Visual Sync for media-mcp
 
 Date: 2026-11-06
-Status: draft for grill-me review — implementation starts only after the open
-decisions in section 8 are settled
+Status: accepted — grill-me session 2026-11-06 settled the open decisions;
+the verdicts are recorded in section 9 and implementation follows them
 Scope: three new analysis layers (motion, rhythm, alignment) on top of the
 existing probe/scene/audio-event/frames machinery, their tool surface, and the
 artifact files they write. No new external dependencies.
@@ -175,4 +175,20 @@ librosa environment is absent.
   transition >= 0.4 s, alignment tolerance ±0.1 s — confirm or adjust.
 - **D6 — manifest integration timing**: defer (recommended) or fold into
   profiles now.
+
+## 9. Decisions (grill-me, 2026-11-06)
+
+| Decision | Verdict |
+|---|---|
+| D1 tool surface | Three separate tools: `media_motion`, `media_beats`, `media_avsync` |
+| D2 rhythm engine | Auxiliary librosa venv + pure-numpy fallback with `degraded: true` |
+| D2a aux venv interpreter | Python 3.12 (matches the `transcribe/.venv` precedent) |
+| D2b aux venv location | In-repo `rhythm/` — pinned `rhythm/requirements.txt` + wrapper, the `transcribe/` pattern; no secrets, no `.env` |
+| D3 optical flow | Deferred to v2; frame-diff + histogram carry v1 |
+| D4 curve storage | `motion.json` (events + summary) plus a `motion-curve.tsv` sidecar in the same entry |
+| D5 defaults | Accepted as proposed: `analysis_fps=10`, `width=320`, burst `k=3`, transition >= 0.4 s, sync tolerance ±0.1 s |
+| D6 manifest integration | Deferred until the three tools are stable |
+| `media_frames(at="beats")` without cached beats | Error naming `media_beats`; no implicit decode |
+| Push 3 pending commits | Pushed to origin/main on 2026-11-06 |
+
 
