@@ -2620,6 +2620,110 @@ def _sort_work(
     return "\n".join(lines)
 
 
+async def media_motion(
+    source: str,
+    analysis_fps: float = 10.0,
+    width: int = 320,
+    identity: str = "sampled",
+) -> str:
+    """Analyze a video's motion: bursts, holds, transitions, keyframes.
+
+    The curve and events are written to `motion.json` plus a
+    `motion-curve.tsv` sidecar in the source's cache entry, both named in
+    the response so the result survives context compaction.
+    """
+    return await _guarded(
+        lambda cancel: _motion_work(
+            load_settings(), source, analysis_fps, width, identity, cancel
+        )
+    )
+
+
+def _motion_work(
+    settings: Settings,
+    source: str,
+    analysis_fps: float,
+    width: int,
+    identity: str,
+    cancel: threading.Event,
+) -> str:
+    """Compute the motion curve, derive events, and write the artifacts."""
+    report = _Report()
+    resolved, path, entry, identity_note = _entry_for(
+        settings, source, identity, report
+    )
+    _record_identity_note(report, identity_note)
+    points = media.motion_curve(
+        path, analysis_fps=analysis_fps, width=width, scratch_dir=entry, cancel=cancel
+    )
+    if len(points) >= media._MOTION_MAX_FRAMES:
+        report.capped.append(
+            f"motion curve stopped at {media._MOTION_MAX_FRAMES} analysis "
+            f"frames ({media._MOTION_MAX_FRAMES / analysis_fps:.0f}s); later "
+            "content was not analyzed"
+        )
+    events = media.motion_events(points, analysis_fps=analysis_fps)
+    report.computed.append(
+        f"motion curve: {len(points)} frames at {analysis_fps} fps, width {width}"
+    )
+    _write_json(
+        entry / "motion.json",
+        {
+            "params": {"analysis_fps": analysis_fps, "width": width},
+            "points": len(points),
+            "events": [asdict(event) for event in events],
+        },
+    )
+    tsv_path = entry / "motion-curve.tsv"
+    tsv_path.write_text(
+        "t\tdiff\thist_dist\n"
+        + "".join(f"{p.t:.3f}\t{p.diff}\t{p.hist_dist}\n" for p in points),
+        encoding="utf-8",
+    )
+    _record_entry(entry, resolved)
+    lines = [
+        "# media_motion",
+        "",
+        f"Source: {resolved.source}",
+        f"Identity: {resolved.kind} {resolved.key}",
+        (
+            f"Analysis: {len(points)} frames at {analysis_fps} fps, "
+            f"width {width}, span "
+            f"{artifacts.format_timestamp(points[0].t)}"
+            f"-{artifacts.format_timestamp(points[-1].t)}"
+        ),
+        "",
+    ]
+    if events:
+        lines.append(f"Events ({len(events)}):")
+        for event in events:
+            span = (
+                artifacts.format_timestamp(event.start)
+                if event.start == event.end
+                else (
+                    f"{artifacts.format_timestamp(event.start)}"
+                    f"-{artifacts.format_timestamp(event.end)}"
+                )
+            )
+            lines.append(f"- {event.kind:<10} {span}  {event.detail}")
+    else:
+        lines.append("Events: none under the default thresholds.")
+    lines += [
+        "",
+        f"Artifacts: {entry / 'motion.json'}",
+        f"           {tsv_path} (full curve)",
+        (
+            "Interpretation: bursts mark animation spans; holds are safe "
+            "still points; transitions are gradual blends the hard-cut "
+            "detector cannot see; keyframes are rest points inside bursts "
+            "worth rasterizing with media_frames."
+        ),
+        "",
+        report.status(),
+    ]
+    return "\n".join(lines)
+
+
 async def media_cache(action: str = "list") -> str:
     """Report the artifact cache: entries, cap, dependencies, eviction."""
     return await _guarded(lambda cancel: _cache_work(load_settings(), action, cancel))
@@ -2691,6 +2795,19 @@ _TOOL_DESCRIPTIONS = {
         "or a timestamped file under <cache>/sorts/ by default — and names that "
         "path in the response so the result survives context compaction."
     ),
+    "media_motion": (
+        "Analyze a video's visual motion in one decimated decode pass "
+        "(default 10 fps at 320 px wide, overridable): per-frame difference "
+        "energy and histogram correlation, summarized as burst (animation "
+        "spans), hold (static points), transition (gradual blends the "
+        "hard-cut detector cannot see), and keyframe (rest points inside "
+        "bursts) events. `source` is an absolute local path or an http/https "
+        "media URL. Writes motion.json plus a motion-curve.tsv sidecar in "
+        "the source's cache entry and names both in the response. Sources "
+        "beyond the frame cap analyze their first span only. Use it to find "
+        "where a motion-graphics video actually animates, then pull frames "
+        "with media_frames."
+    ),
     "media_cache": (
         "Report the artifact cache: `list` shows the entry table, `stats` shows "
         "total_bytes against the cap plus the transcription dependency self-check, "
@@ -2701,7 +2818,7 @@ _TOOL_DESCRIPTIONS = {
 
 
 def build_server() -> MCPServer:
-    """Create the MCP server and register the seven tools.
+    """Create the MCP server and register the media tools.
 
     Registration goes through the SDK's `tool(...)` decorator, which is what
     `mcp.server.MCPServer` (the class `FastMCP` became in mcp 2.x) exposes for
@@ -2718,6 +2835,7 @@ def build_server() -> MCPServer:
         media_search,
         media_image_quality,
         media_image_sort,
+        media_motion,
         media_cache,
     ):
         server.tool(
@@ -2729,7 +2847,7 @@ def build_server() -> MCPServer:
 
 
 def main() -> None:
-    """Serve the seven tools over stdio, stopping every child on the way out."""
+    """Serve the media tools over stdio, stopping every child on the way out."""
     server = build_server()
     try:
         server.run(transport="stdio")

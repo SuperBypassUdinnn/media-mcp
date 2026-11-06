@@ -48,9 +48,12 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import BinaryIO, Generic, TypeVar
+from typing import TYPE_CHECKING, BinaryIO, Generic, TypeVar
 
 from media.artifacts import format_timestamp
+
+if TYPE_CHECKING:
+    import numpy as np  # annotations only; runtime imports stay lazy
 
 try:
     import cv2
@@ -820,6 +823,378 @@ def diff_hash(png_bytes: bytes) -> int:
             "geometry would make hamming comparisons mean something else"
         )
     return diff_hash_of(raster)
+
+
+# ---------------------------------------------------------------------------
+# Motion analysis: the decimated frame-diff layer behind media_motion.
+#
+# One ffmpeg pass decodes the source at a reduced analysis rate into a raw
+# grayscale raster file (not stdout: `run_child` bounds captured output at
+# 8 MiB, and a raster for an hour of video is gigabytes, so the child writes
+# the raster to a scratch file and keeps its stdout empty). numpy then walks
+# the raster frame by frame computing the two signals the design names —
+# mean absolute frame difference and 32-bin grayscale histogram correlation —
+# and the event extraction turns those curves into bursts, holds, gradual
+# transitions, and keyframes. Defaults (analysis_fps=10, width=320) are the
+# grill-me verdicts in docs/design-motion-avsync.md section 9.
+# ---------------------------------------------------------------------------
+
+_MOTION_HIST_BINS = 64
+_MOTION_MAX_FRAMES = 36000  # one hour at the default 10 fps; caps the raster
+
+
+@dataclass(frozen=True)
+class MotionCurvePoint:
+    """One analysis frame's motion signals.
+
+    `t` is the frame's media-time second (`index / analysis_fps`), `diff` is
+    the mean absolute grayscale difference against the previous analysis
+    frame in 0..255 levels (0.0 for the first frame, which has no
+    predecessor), and `hist_dist` is the one-dimensional earth mover's
+    distance between the two frames' 64-bin grayscale histograms — the mean
+    absolute shift of the cumulative distribution, 0..1 (0.0 for the first
+    frame). Earth mover's distance is used because flat-color content puts
+    all histogram mass in one bin: a gradual fade then shifts the whole
+    mass a few bins per frame, which a support-overlap measure reports as
+    total displacement 1.0 while EMD reports the honest small shift, and
+    motion graphics are full of exactly such flat-color scenes.
+    """
+
+    t: float
+    diff: float
+    hist_dist: float
+
+
+@dataclass(frozen=True)
+class MotionEvent:
+    """One derived span of the motion timeline.
+
+    `kind` is `"burst"` (frame difference sustained above the local
+    baseline), `"hold"` (difference at or below the static floor),
+    `"transition"` (histogram earth mover's distance sustained above the
+    shift floor — the gradual blend/wipe signal `scdet` cannot see), or
+    `"keyframe"` (a local difference minimum inside a burst: the
+    animation's rest point).
+    `start`/`end` are media-time seconds; a `keyframe` is a point event with
+    `start == end`. `detail` carries the measurement behind the event in
+    readable form without repeating the kind.
+    """
+
+    kind: str
+    start: float
+    end: float
+    detail: str
+
+
+def _motion_frame_geometry(
+    raster_bytes: int, width: int, source_width: int, source_height: int
+) -> tuple[int, int]:
+    """Derive (scaled_height, frame_count) from the raster's exact size.
+
+    ffmpeg's `scale=<width>:-2` rounds the scaled height to an even value;
+    rather than trusting one rounding rule, the few even candidates around
+    the arithmetic expectation are tried against the file's byte count, and
+    the one that divides it into whole frames wins. No candidate fitting is
+    a `MediaError` naming the byte count, so a changed ffmpeg scaling rule
+    fails loudly instead of misreading the raster as shifted frames.
+    """
+    base = round(source_height * width / source_width)
+    frame_bytes = 0
+    scaled_height = 0
+    for candidate in sorted({_even(base - 2), _even(base), _even(base + 2)}):
+        if candidate > 0 and raster_bytes % (width * candidate) == 0:
+            scaled_height = candidate
+            frame_bytes = width * candidate
+            break
+    if not frame_bytes:
+        raise MediaError(
+            f"motion raster of {raster_bytes} bytes does not divide into "
+            f"{width}-wide gray frames around expected height {base}; a "
+            "changed ffmpeg scale rule would make frame indexing lie"
+        )
+    return scaled_height, raster_bytes // frame_bytes
+
+
+def _even(value: int) -> int:
+    """Round `value` up to the next even integer (ffmpeg's `-2` behavior)."""
+    return value if value % 2 == 0 else value + 1
+
+
+def motion_curve(
+    path: Path,
+    *,
+    analysis_fps: float = 10.0,
+    width: int = 320,
+    scratch_dir: Path | None = None,
+    cancel: threading.Event | None = None,
+) -> list[MotionCurvePoint]:
+    """Decode `path` decimated and return its per-frame motion signals.
+
+    One ffmpeg pass runs `fps=<analysis_fps>,scale=<width>:-2,format=gray`
+    over the whole source and writes the raw one-byte-per-pixel raster to
+    `<scratch_dir>/motion-raster.gray` (or a fresh temp directory when
+    `scratch_dir` is `None`); the file is deleted before returning, success
+    or failure. Frames are then read one at a time — memory stays at two
+    frames no matter how long the source is — and each frame yields a
+    `MotionCurvePoint` against its predecessor. The raster is capped at
+    `_MOTION_MAX_FRAMES` frames; longer sources analyze their first hour and
+    the caller reports the cap. A source with no video stream, non-positive
+    parameters, a failed ffmpeg run, or a raster that does not divide into
+    whole frames raises `MediaError`.
+    """
+    import numpy as np
+
+    if analysis_fps <= 0 or width <= 0:
+        raise MediaError(
+            "motion analysis needs analysis_fps > 0 and width > 0, got "
+            f"{analysis_fps} and {width}"
+        )
+    path = Path(path)
+    result = probe(path)
+    if not result.has_video:
+        raise MediaError(f"motion analysis needs a video stream; {path} has none")
+    scratch = Path(scratch_dir) if scratch_dir is not None else Path(tempfile.mkdtemp())
+    scratch.mkdir(parents=True, exist_ok=True)
+    raster_path = scratch / "motion-raster.gray"
+    argv = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(path),
+        "-vf",
+        (
+            f"fps={_plain_decimal(analysis_fps)},"
+            f"scale={_plain_decimal(width)}:-2,format=gray"
+        ),
+        "-frames:v",
+        str(_MOTION_MAX_FRAMES),
+        "-f",
+        "rawvideo",
+        str(raster_path),
+    ]
+    try:
+        done = run_child(argv, cancel=cancel)
+        if done.returncode != 0 or not raster_path.is_file():
+            raise MediaError(
+                f"motion raster decode failed for {path}: ffmpeg exited "
+                f"{done.returncode}; captured stderr: {done.stderr.strip() or '(none)'}"
+            )
+        scaled_height, frame_count = _motion_frame_geometry(
+            raster_path.stat().st_size, width, result.width, result.height
+        )
+        frame_bytes = width * scaled_height
+        points: list[MotionCurvePoint] = []
+        prev: np.ndarray | None = None
+        with raster_path.open("rb") as raster:
+            for index in range(frame_count):
+                buffer = raster.read(frame_bytes)
+                if len(buffer) < frame_bytes:
+                    break  # truncated tail: analyze what decoded cleanly
+                current = np.frombuffer(buffer, np.uint8).reshape(scaled_height, width)
+                if prev is None:
+                    diff, dist = 0.0, 0.0
+                else:
+                    diff = float(
+                        np.abs(current.astype(np.int16) - prev.astype(np.int16)).mean()
+                    )
+                    dist = _motion_hist_dist(current, prev)
+                points.append(
+                    MotionCurvePoint(
+                        t=index / analysis_fps, diff=round(diff, 4), hist_dist=dist
+                    )
+                )
+                prev = current
+        return points
+    finally:
+        raster_path.unlink(missing_ok=True)
+
+
+def _motion_hist_dist(current: np.ndarray, previous: np.ndarray) -> float:
+    """Earth mover's distance between two frames' 64-bin gray histograms.
+
+    The one-dimensional Wasserstein-1 distance between the normalized
+    histograms equals the mean absolute shift of their cumulative
+    distributions, divided by the bin count to land in 0..1. It measures how
+    far pixel mass traveled between frames, so a flat-color fade (all mass
+    in one bin, sliding a few bins per frame) reports a small honest value
+    where a support-overlap measure would report total displacement.
+    """
+    import numpy as np
+
+    bins = _MOTION_HIST_BINS
+    a = np.bincount(current.ravel() // (256 // bins), minlength=bins)[:bins]
+    b = np.bincount(previous.ravel() // (256 // bins), minlength=bins)[:bins]
+    a = a.astype(np.float64)
+    b = b.astype(np.float64)
+    a /= a.sum()
+    b /= b.sum()
+    shift = float(np.abs(a.cumsum() - b.cumsum()).sum())
+    return round(min(1.0, shift / bins), 4)
+
+
+def _rolling_median(values: np.ndarray, window: int) -> np.ndarray:
+    """Sliding-window median with edge padding, same length as `values`.
+
+    `window` is forced odd and at least 1; edges are padded by repeating the
+    boundary values, so the baseline near the start and end of the clip is
+    the local baseline rather than a shrinking window's artifact.
+    """
+    window = max(1, int(window) | 1)
+    import numpy as np
+
+    if values.size == 0 or window == 1:
+        return values.astype(np.float64).copy()
+    pad = window // 2
+    padded = np.pad(values.astype(np.float64), pad, mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, window)
+    return np.median(windows, axis=1)
+
+
+def _motion_runs(
+    kind: str,
+    mask: np.ndarray,
+    timestamps: np.ndarray,
+    step: float,
+    min_duration: float,
+    bridge_frames: int,
+    detail_of: object,
+) -> list[MotionEvent]:
+    """Group contiguous `mask` runs into events of one `kind`.
+
+    Gaps of up to `bridge_frames` False values inside a run do not split it
+    — frame-rate conversion duplicates and codec noise punch single-frame
+    holes into otherwise steady signals, and a real event survives them.
+    A run survives when its span (`length * step`) reaches `min_duration`;
+    `detail_of(first_index, last_index)` renders the run's measurement for
+    the event's `detail`. Runs are emitted in timeline order.
+    """
+    events: list[MotionEvent] = []
+    run_start: int | None = None
+    last_active: int | None = None
+    for index in range(mask.size + 1):
+        active = index < mask.size and bool(mask[index])
+        if active:
+            if run_start is None:
+                run_start = index
+            last_active = index
+        elif run_start is not None:
+            # `active` is False on this branch, so this is a gap check: a gap
+            # longer than `bridge_frames` closes the run, a shorter one lets
+            # it continue across the hole. End of the mask always closes it.
+            at_end = index >= mask.size
+            if at_end or last_active is None or index - last_active > bridge_frames:
+                span = (last_active + 1 - run_start) * step
+                if span >= min_duration:
+                    events.append(
+                        MotionEvent(
+                            kind=kind,
+                            start=round(float(timestamps[run_start]), 3),
+                            end=round(float(timestamps[last_active]) + step, 3),
+                            detail=detail_of(run_start, last_active),
+                        )
+                    )
+                run_start = None
+                last_active = None
+    return events
+
+
+def motion_events(
+    points: list[MotionCurvePoint],
+    *,
+    analysis_fps: float,
+    burst_k: float = 3.0,
+    burst_min_s: float = 0.3,
+    hold_max_diff: float = 1.0,
+    hold_min_s: float = 0.5,
+    transition_min_dist: float = 0.01,
+    transition_min_s: float = 0.4,
+    bridge_frames: int = 2,
+) -> list[MotionEvent]:
+    """Turn a motion curve into bursts, holds, transitions, and keyframes.
+
+    A **burst** is a run where the frame difference clears `burst_k` times
+    the 5-second rolling median, with an absolute floor of 1.0 level so a
+    nearly static clip's tiny baseline cannot flag its own encoding noise;
+    runs shorter than `burst_min_s` are dropped. A **hold** is a run at or
+    below `hold_max_diff` lasting at least `hold_min_s`. A **transition**
+    is a run where the histogram earth mover's distance stays at or above
+    `transition_min_dist` for at least `transition_min_s` — sustained
+    histogram travel separates a gradual blend from a one-frame hard cut,
+    which `scdet` already reports. Runs of every kind bridge gaps of up to
+    `bridge_frames` False values, because frame-rate conversion duplicates
+    and codec noise punch single-frame holes into steady signals. A
+    **keyframe** is a local difference minimum strictly inside a burst
+    (both neighbors higher): the animation's rest point worth rasterizing.
+    Events return sorted by `(start, kind)`; an empty curve returns `[]`.
+    """
+    import numpy as np
+
+    if not points:
+        return []
+    diffs = np.array([p.diff for p in points], dtype=np.float64)
+    dists = np.array([p.hist_dist for p in points], dtype=np.float64)
+    times = np.array([p.t for p in points], dtype=np.float64)
+    step = 1.0 / analysis_fps
+    events: list[MotionEvent] = []
+
+    baseline = _rolling_median(diffs, int(analysis_fps * 5))
+    burst_mask = diffs > np.maximum(burst_k * baseline, 1.0)
+    events += _motion_runs(
+        "burst",
+        burst_mask,
+        times,
+        step,
+        burst_min_s,
+        bridge_frames,
+        lambda first, last: (
+            f"peak diff {diffs[first : last + 1].max():.2f} levels, "
+            f"baseline {baseline[first : last + 1].mean():.2f}"
+        ),
+    )
+    events += _motion_runs(
+        "hold",
+        diffs <= hold_max_diff,
+        times,
+        step,
+        hold_min_s,
+        bridge_frames,
+        lambda first, last: f"max diff {diffs[first : last + 1].max():.2f} levels",
+    )
+    events += _motion_runs(
+        "transition",
+        dists >= transition_min_dist,
+        times,
+        step,
+        transition_min_s,
+        bridge_frames,
+        lambda first, last: (
+            f"max hist shift {dists[first : last + 1].max():.3f} over "
+            f"{(last - first + 1) * step:.1f}s"
+        ),
+    )
+
+    burst_spans = [
+        (event.start, event.end) for event in events if event.kind == "burst"
+    ]
+    for start, end in burst_spans:
+        inside = np.flatnonzero((times > start) & (times < end))
+        for index in inside[1:-1] if inside.size > 2 else []:
+            if diffs[index] < diffs[index - 1] and diffs[index] < diffs[index + 1]:
+                events.append(
+                    MotionEvent(
+                        kind="keyframe",
+                        start=round(float(times[index]), 3),
+                        end=round(float(times[index]), 3),
+                        detail=f"diff {diffs[index]:.2f} levels inside burst",
+                    )
+                )
+
+    events.sort(key=lambda event: (event.start, event.kind))
+    return events
 
 
 def sample_candidates(

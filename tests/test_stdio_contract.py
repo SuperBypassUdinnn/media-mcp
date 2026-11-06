@@ -48,6 +48,7 @@ TOOL_NAMES = {
     "media_search",
     "media_image_quality",
     "media_image_sort",
+    "media_motion",
     "media_cache",
 }
 
