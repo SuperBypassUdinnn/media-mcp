@@ -1465,6 +1465,154 @@ def detect_beats(
     )
 
 
+# ---------------------------------------------------------------------------
+# Audio-visual alignment: the zero-decode correlation behind media_avsync.
+#
+# Pure post-processing over timestamps the earlier layers already measured:
+# scdet cuts and rhythm onsets (both corrected by the probe's container-level
+# A/V offset), compared against a shuffled-onsets baseline so a "synced"
+# verdict is measured, not vibes. No decode happens here.
+# ---------------------------------------------------------------------------
+
+_SYNC_BASELINE_SHUFFLES = 40
+
+
+@dataclass(frozen=True)
+class SyncResult:
+    """How a source's visual cuts relate to its audio onsets.
+
+    `cuts` and `onsets` are the input counts; `median_distance_s` and
+    `p90_distance_s` summarize each cut's distance to the nearest onset
+    after the A/V offset correction, and `share_within_tolerance` is the
+    fraction of cuts landing within `tolerance_s` of one. `baseline_share`
+    is the same statistic against randomly shuffled onsets — the chance
+    level a real edit must beat. `verdict` is `"synced"` when the share
+    clears the baseline by a margin and is at least even, `"unsynced"` when
+    it does not beat the baseline at all, else `"inconclusive"`.
+    `beat_phase` is the cuts' circular mean position inside the beat period
+    (0..1; near 0.0 or 1.0 means cuts land on beats) or None without a
+    usable grid. `offset_s` records the correction applied.
+    """
+
+    cuts: int
+    onsets: int
+    tolerance_s: float
+    median_distance_s: float | None
+    p90_distance_s: float | None
+    share_within_tolerance: float | None
+    baseline_share: float | None
+    verdict: str
+    beat_phase: float | None
+    offset_s: float
+
+
+def _nearest_distances(cuts: np.ndarray, onsets: np.ndarray) -> np.ndarray:
+    """Each cut's distance to the nearest onset (empty-safe)."""
+    import numpy as np
+
+    if cuts.size == 0 or onsets.size == 0:
+        return np.array([])
+    return np.abs(cuts[:, None] - onsets[None, :]).min(axis=1)
+
+
+def _share_within(distances: np.ndarray, tolerance: float) -> float | None:
+    """Fraction of distances within `tolerance`, or None with no distances."""
+    if distances.size == 0:
+        return None
+    return float((distances <= tolerance).mean())
+
+
+def _circular_mean_phase(fractions: np.ndarray) -> float:
+    """Circular mean of fractions in [0, 1), itself folded back into [0, 1)."""
+    import numpy as np
+
+    if fractions.size == 0:
+        return 0.0
+    angles = 2.0 * math.pi * fractions
+    mean_angle = math.atan2(float(np.sin(angles).mean()), float(np.cos(angles).mean()))
+    phase = (mean_angle / (2.0 * math.pi)) % 1.0
+    return round(phase, 4)
+
+
+def align_cuts_to_onsets(
+    cuts: list[float],
+    onsets: list[float],
+    *,
+    duration: float,
+    offset: float = 0.0,
+    tolerance: float = 0.1,
+    beats: list[float] | None = None,
+) -> SyncResult:
+    """Correlate visual cuts with audio onsets, zero decodes.
+
+    Every onset is moved to container time first (`onset + offset`, the
+    probe's `audio.start_time - video.start_time`), so a container-level
+    offset never masquerades as bad editing. The measured statistic is each
+    cut's distance to the nearest onset; the baseline reruns the same
+    statistic over `_SYNC_BASELINE_SHUFFLES` fixed-seed shuffles of the
+    onsets inside `duration`, which is the share a non-synced edit scores
+    by chance. The beat phase uses `beats` when the grid has at least four
+    teeth: each cut's position inside the beat period, averaged circularly.
+    A source with no cuts or no onsets yields an `"inconclusive"` verdict
+    with None statistics rather than an error — "nothing to compare" is a
+    finding, not a failure.
+    """
+    import numpy as np
+
+    cut_arr = np.array([c for c in cuts if 0.0 <= c <= duration], dtype=np.float64)
+    onset_arr = np.array(
+        [o + offset for o in onsets if 0.0 <= o + offset <= duration],
+        dtype=np.float64,
+    )
+    distances = _nearest_distances(cut_arr, onset_arr)
+    share = _share_within(distances, tolerance)
+    median = float(np.median(distances)) if distances.size else None
+    p90 = float(np.percentile(distances, 90)) if distances.size else None
+
+    baseline_share = None
+    if distances.size and onset_arr.size:
+        rng = np.random.default_rng(0)
+        shares = []
+        for _ in range(_SYNC_BASELINE_SHUFFLES):
+            sample = rng.permutation(onset_arr.size)
+            fake = rng.uniform(0.0, duration, size=cut_arr.size)
+            one = _share_within(_nearest_distances(fake, onset_arr[sample]), tolerance)
+            if one is not None:
+                shares.append(one)
+        baseline_share = round(float(np.mean(shares)), 4) if shares else None
+
+    if share is None or baseline_share is None:
+        verdict = "inconclusive"
+    elif share >= max(0.5, baseline_share + 0.15):
+        verdict = "synced"
+    elif share <= baseline_share + 0.05:
+        verdict = "unsynced"
+    else:
+        verdict = "inconclusive"
+
+    beat_phase = None
+    grid = [b for b in (beats or []) if 0.0 <= b <= duration]
+    if len(grid) >= 4:
+        periods = np.diff(np.array(grid, dtype=np.float64))
+        period = float(np.median(periods))
+        if period > 0:
+            fractions = ((cut_arr - grid[0]) / period) % 1.0
+            beat_phase = _circular_mean_phase(fractions)
+
+    return SyncResult(
+        cuts=int(cut_arr.size),
+        onsets=int(onset_arr.size),
+        tolerance_s=tolerance,
+        median_distance_s=round(median, 4) if median is not None else None,
+        p90_distance_s=round(p90, 4) if p90 is not None else None,
+        share_within_tolerance=round(share, 4) if share is not None else None,
+        baseline_share=baseline_share,
+        verdict=verdict,
+        beat_phase=beat_phase,
+        offset_s=round(offset, 3),
+    )
+
+
 def sample_candidates(
     scenes: list[SceneScore],
     duration: float,

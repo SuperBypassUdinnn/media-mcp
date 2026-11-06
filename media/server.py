@@ -2809,6 +2809,149 @@ def _beats_work(
     return "\n".join(lines)
 
 
+def _ensure_scenes_only(
+    entry: Path, path: Path, report: _Report
+) -> list[media.SceneScore]:
+    """Return scdet cuts, from `scenes.json` when cached, else one pass.
+
+    Unlike `_ensure_scene_candidates`, this never builds ranked candidates
+    (no frame hashing), so it stays inside media_avsync's zero-decode
+    promise when the cache is warm; a cold cache pays exactly one scdet
+    pass and merges the scenes into whatever `scenes.json` already holds.
+    """
+    scenes_path = entry / "scenes.json"
+    data = _read_json(scenes_path)
+    if isinstance(data, dict) and "scenes" in data:
+        try:
+            scenes = [
+                media.SceneScore(float(item["timestamp"]), float(item["score"]))
+                for item in data["scenes"]
+            ]
+        except (KeyError, TypeError, ValueError) as err:
+            report.skipped["scenes.json"] = (
+                f"cached scenes.json is unreadable ({err}); re-detecting"
+            )
+        else:
+            report.cached.append("scenes.json")
+            return scenes
+    scenes = media.detect_scenes(path)
+    report.computed.append("scenes")
+    merged = dict(data) if isinstance(data, dict) else {}
+    merged["scenes"] = [
+        {"timestamp": scene.timestamp, "score": scene.score} for scene in scenes
+    ]
+    _write_json(scenes_path, merged)
+    return scenes
+
+
+async def media_avsync(
+    source: str, tolerance: float = 0.1, identity: str = "sampled"
+) -> str:
+    """Correlate a source's visual cuts with its audio onsets.
+
+    Reads the cached scene cuts, the cached beats.json (run media_beats
+    first; a missing one is an error naming it, never an implicit audio
+    decode), and the probe's A/V offset - zero decodes when the cache is
+    warm. Writes sync.json in the source's entry and names it in the
+    response.
+    """
+    return await _guarded(
+        lambda cancel: _avsync_work(
+            load_settings(), source, tolerance, identity, cancel
+        )
+    )
+
+
+def _avsync_work(
+    settings: Settings,
+    source: str,
+    tolerance: float,
+    identity: str,
+    cancel: threading.Event,
+) -> str:
+    report = _Report()
+    resolved, path, entry, identity_note = _entry_for(
+        settings, source, identity, report
+    )
+    _record_identity_note(report, identity_note)
+    beats_path = entry / "beats.json"
+    data = _read_json(beats_path)
+    if not isinstance(data, dict) or "onsets" not in data:
+        raise MediaError(
+            f"media_avsync needs {beats_path} from a media_beats run; run "
+            "media_beats on this source first (no implicit audio decode)"
+        )
+    report.cached.append("beats.json")
+    probe_result = _ensure_probe(entry, path, report)
+    offset = media.av_offset_seconds(probe_result)
+    cuts = [scene.timestamp for scene in _ensure_scenes_only(entry, path, report)]
+    onsets = [float(o) for o in data.get("onsets") or []]
+    beats = [float(b) for b in data.get("beats") or []]
+    result = media.align_cuts_to_onsets(
+        cuts,
+        onsets,
+        duration=probe_result.duration,
+        offset=offset,
+        tolerance=tolerance,
+        beats=beats,
+    )
+    _write_json(
+        entry / "sync.json",
+        {
+            "params": {"tolerance_s": tolerance, "offset_s": offset},
+            "cuts": result.cuts,
+            "onsets": result.onsets,
+            "median_distance_s": result.median_distance_s,
+            "p90_distance_s": result.p90_distance_s,
+            "share_within_tolerance": result.share_within_tolerance,
+            "baseline_share": result.baseline_share,
+            "verdict": result.verdict,
+            "beat_phase": result.beat_phase,
+            "source": resolved.source,
+        },
+    )
+    lines = [
+        "# media_avsync",
+        "",
+        f"Source: {resolved.source}",
+        f"Identity: {resolved.kind} {resolved.key}",
+        (
+            f"Inputs: {result.cuts} cuts x {result.onsets} onsets, "
+            f"A/V offset {offset:+.3f}s, tolerance +-{tolerance}s"
+        ),
+        (
+            f"Distances: median {result.median_distance_s}s, "
+            f"p90 {result.p90_distance_s}s"
+            if result.median_distance_s is not None
+            else "Distances: nothing to compare"
+        ),
+        (
+            f"Share of cuts on an onset: {result.share_within_tolerance} "
+            f"(chance baseline {result.baseline_share})"
+            if result.share_within_tolerance is not None
+            else "Share: nothing to compare"
+        ),
+        (
+            f"Beat phase of cuts: {result.beat_phase} "
+            "(0.0 or 1.0 means cuts land on beats)"
+            if result.beat_phase is not None
+            else "Beat phase: no usable beat grid"
+        ),
+        f"Verdict: {result.verdict}",
+        "",
+        f"Artifact: {entry / 'sync.json'}",
+        (
+            "Interpretation: 'synced' means the share of cuts within "
+            "tolerance of an onset beats the shuffled baseline by a margin "
+            "and is at least even; 'unsynced' means it does not beat chance; "
+            "'inconclusive' means too few cuts or onsets to judge."
+        ),
+        "",
+        report.status(),
+    ]
+    return "\n".join(lines)
+
+
 async def media_cache(action: str = "list") -> str:
     """Report the artifact cache: entries, cap, dependencies, eviction."""
     return await _guarded(lambda cancel: _cache_work(load_settings(), action, cancel))
@@ -2903,6 +3046,17 @@ _TOOL_DESCRIPTIONS = {
         "consumes the same file. Use it for AMV-style work: find the beat "
         "grid, then pull frames on it."
     ),
+    "media_avsync": (
+        "Correlate a media source's visual cuts with its audio onsets - "
+        "is the edit on the beat? Reads the cached scene cuts, the cached "
+        "beats.json (run media_beats first; a missing one is an error "
+        "naming it, never an implicit decode), and the probe's A/V "
+        "offset. Reports per-cut distance to the nearest onset, the "
+        "share of cuts within tolerance against a shuffled-onsets "
+        "baseline, the cuts' beat phase, and a synced/unsynced/"
+        "inconclusive verdict. Zero decodes on a warm cache. Writes "
+        "sync.json in the source's entry and names it in the response."
+    ),
     "media_cache": (
         "Report the artifact cache: `list` shows the entry table, `stats` shows "
         "total_bytes against the cap plus the transcription dependency self-check, "
@@ -2932,6 +3086,7 @@ def build_server() -> MCPServer:
         media_image_sort,
         media_motion,
         media_beats,
+        media_avsync,
         media_cache,
     ):
         server.tool(

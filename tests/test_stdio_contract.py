@@ -50,6 +50,7 @@ TOOL_NAMES = {
     "media_image_sort",
     "media_motion",
     "media_beats",
+    "media_avsync",
     "media_cache",
 }
 
