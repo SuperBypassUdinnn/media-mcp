@@ -57,8 +57,14 @@ Per analysis frame, computed in-process with numpy/cv2:
 
 - **frame-diff energy**: mean absolute difference against the previous
   analysis frame (the cheap, robust motion signal);
-- **histogram distance**: correlation of 32-bin grayscale histograms
-  (separates content change from brightness flicker);
+- **histogram earth mover's distance**: the mean absolute shift of the two
+  frames' cumulative 64-bin grayscale histograms. Measured amendment
+  (2026-11-06): the drafted Pearson correlation was rejected — flat-color
+  fades keep consecutive histograms shape-correlated through the blend, so
+  the signal alternated between "nothing changed" and "total
+  displacement". EMD reports the honest few-bins-per-frame shift, and
+  motion graphics are full of exactly such flat-color scenes; single-frame
+  holes from frame-rate conversion are bridged (2 analysis frames).
 - **optical flow magnitude** (optional, off by default): Farneback via the
   already-present `cv2`, computed only every Nth frame pair to bound cost.
 
