@@ -155,6 +155,27 @@ def test_media_avsync_tool(tmp_path, monkeypatch):
     assert payload["share_within_tolerance"] >= 0.5
 
 
+def test_media_avsync_joins_burst_starts(tmp_path, monkeypatch):
+    """Spec section 5: motion-burst starts join the scdet cuts.
+
+    A crossfade has no scdet cut; its motion burst start is the only visual
+    event, so alignment must see it once media_motion has run.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("MEDIA_CACHE_DIR", str(cache))
+    monkeypatch.setenv("MEDIA_RHYTHM_BIN", str(REPO_ROOT / "rhythm" / "rhythm.sh"))
+    path = _write_cut_on_beats_video(tmp_path / "amv.mp4", tmp_path)
+    asyncio.run(media.server.media_beats(str(path)))
+    asyncio.run(media.server.media_motion(str(path)))
+    result = asyncio.run(media.server.media_avsync(str(path)))
+    assert "motion.json bursts" in result, result
+    # With motion present the comparison set can only grow, never shrink.
+    sync_json = next(cache.rglob("sync.json"))
+    payload = json.loads(sync_json.read_text())
+    assert payload["cuts"] >= 2, payload
+
+
 def test_media_avsync_requires_beats(tmp_path, monkeypatch):
     cache = tmp_path / "cache"
     cache.mkdir()

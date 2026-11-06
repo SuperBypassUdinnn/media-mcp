@@ -156,6 +156,11 @@ def test_media_beats_tool(tmp_path, monkeypatch):
     assert payload["degraded"] == (payload["engine"] == "numpy")
     _onsets_match(list(payload["onsets"]), tolerance=0.1)
     assert payload["source"] == str(path)
+    # Spec section 4: beats.json carries a confidence field (beat-onset
+    # agreement); the click track's grid should agree with itself strongly.
+    assert "confidence" in payload
+    if payload["beats"]:
+        assert payload["confidence"] is None or payload["confidence"] >= 0.5
 
 
 def test_media_frames_at_beats(tmp_path, monkeypatch):

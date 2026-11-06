@@ -2677,11 +2677,24 @@ def _motion_work(
     report.computed.append(
         f"motion curve: {len(points)} frames at {analysis_fps} fps, width {width}"
     )
+    diffs = [point.diff for point in points]
+    distances = [point.hist_dist for point in points]
     _write_json(
         entry / "motion.json",
         {
             "params": {"analysis_fps": analysis_fps, "width": width},
             "points": len(points),
+            "summary": {
+                "span_s": round(points[-1].t, 3) if points else 0.0,
+                "peak_diff": round(max(diffs), 4) if diffs else 0.0,
+                "mean_diff": round(sum(diffs) / len(diffs), 4) if diffs else 0.0,
+                "max_hist_dist": round(max(distances), 4) if distances else 0.0,
+                "quiet_share": (
+                    round(sum(1 for d in diffs if d <= 1.0) / len(diffs), 3)
+                    if diffs
+                    else 1.0
+                ),
+            },
             "events": [asdict(event) for event in events],
         },
     )
@@ -2776,6 +2789,7 @@ def _beats_work(
             "tempo": result.tempo,
             "beats": list(result.beats),
             "onsets": list(result.onsets),
+            "confidence": result.confidence,
             "source": resolved.source,
         },
     )
@@ -2807,6 +2821,12 @@ def _beats_work(
             + (" ..." if len(result.beats) > 8 else "")
             if result.beats
             else "Beat grid: none"
+        ),
+        (
+            f"Confidence: {result.confidence} (share of beats with an onset "
+            "within 70 ms)"
+            if result.confidence is not None
+            else "Confidence: not measurable (no beats or no onsets)"
         ),
         "",
         f"Artifact: {entry / 'beats.json'}",
@@ -2896,6 +2916,27 @@ def _avsync_work(
     probe_result = _ensure_probe(entry, path, report)
     offset = media.av_offset_seconds(probe_result)
     cuts = [scene.timestamp for scene in _ensure_scenes_only(entry, path, report)]
+    motion_data = _read_json(entry / "motion.json")
+    if isinstance(motion_data, dict):
+        starts = [
+            float(event["start"])
+            for event in motion_data.get("events") or []
+            if event.get("kind") == "burst"
+        ]
+        # Burst starts whose own hard cut already sits within 0.25 s add no
+        # new visual moment; keep one entry per visual event, preferring the
+        # scdet timestamp when both saw it.
+        known = set(cuts)
+        for start in starts:
+            if all(abs(start - cut) > 0.25 for cut in known):
+                cuts.append(start)
+                known.add(start)
+        report.cached.append("motion.json bursts")
+    else:
+        report.skipped["motion.json"] = (
+            "absent; alignment ran on scdet cuts only - run media_motion "
+            "for burst starts to join the comparison"
+        )
     onsets = [float(o) for o in data.get("onsets") or []]
     beats = [float(b) for b in data.get("beats") or []]
     result = media.align_cuts_to_onsets(

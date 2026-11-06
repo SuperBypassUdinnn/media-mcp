@@ -310,6 +310,11 @@ def test_media_motion_tool(tmp_path, monkeypatch):
     assert payload["params"] == {"analysis_fps": 10.0, "width": 320}
     assert payload["points"] > 0
     assert any(e["kind"] == "transition" for e in payload["events"])
+    # Spec section 3: motion.json carries a curve summary beside the events.
+    summary = payload["summary"]
+    assert summary["span_s"] > 0
+    assert summary["peak_diff"] >= summary["mean_diff"] >= 0.0
+    assert 0.0 <= summary["quiet_share"] <= 1.0
     curve_tsv = next(cache.rglob("motion-curve.tsv"))
     header, *rows = curve_tsv.read_text().splitlines()
     assert header == "t\tdiff\thist_dist"

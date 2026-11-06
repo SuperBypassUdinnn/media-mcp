@@ -82,13 +82,24 @@ def main() -> int:
         tempo_value = float(np.atleast_1d(tempo)[0])
         if not np.isfinite(tempo_value) or tempo_value <= 0:
             tempo_value = None
+        beat_list = [round(float(b), 3) for b in beat_frames]
+        onset_list = [round(float(o), 3) for o in onsets]
+        confidence = None
+        if beat_list and onset_list:
+            hits = sum(
+                1
+                for beat in beat_list
+                if min(abs(beat - onset) for onset in onset_list) <= 0.07
+            )
+            confidence = round(hits / len(beat_list), 3)
     payload = {
         "engine": "librosa",
         "degraded": False,
         "duration": round(duration, 3),
         "tempo": round(tempo_value, 2) if tempo_value is not None else None,
-        "beats": [round(float(b), 3) for b in beat_frames],
-        "onsets": [round(float(o), 3) for o in onsets],
+        "beats": beat_list,
+        "onsets": onset_list,
+        "confidence": confidence,
     }
     print(json.dumps(payload))
     return 0

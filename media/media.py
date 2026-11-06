@@ -1166,7 +1166,7 @@ def motion_events(
     )
     events += _motion_runs(
         "transition",
-        dists >= transition_min_dist,
+        (dists >= transition_min_dist) & (diffs >= _MOTION_TRANSITION_MIN_DIFF),
         times,
         step,
         transition_min_s,
@@ -1237,6 +1237,7 @@ class BeatResult:
     tempo: float | None
     beats: tuple[float, ...]
     onsets: tuple[float, ...]
+    confidence: float | None
 
 
 def _decode_mono_pcm(
@@ -1421,6 +1422,24 @@ def _beat_grid(onsets: list[float], tempo: float, duration: float) -> list[float
     return beats
 
 
+def _beat_confidence(
+    beats: tuple[float, ...], onsets: tuple[float, ...]
+) -> float | None:
+    """Share of beats with an onset within 70 ms — both engines' confidence.
+
+    Beat-onset agreement is the one confidence measure computable identically
+    from the two engines' outputs (spec section 4 names a confidence field
+    without pinning an engine-specific statistic). None when there are no
+    beats or no onsets to agree with.
+    """
+    if not beats or not onsets:
+        return None
+    hits = sum(
+        1 for beat in beats if min(abs(beat - onset) for onset in onsets) <= 0.07
+    )
+    return round(hits / len(beats), 3)
+
+
 def detect_beats(
     path: Path,
     *,
@@ -1446,13 +1465,21 @@ def detect_beats(
             try:
                 payload = json.loads(done.stdout)
                 tempo = payload.get("tempo")
+                beats = tuple(float(b) for b in payload.get("beats", []))
+                onsets = tuple(float(o) for o in payload.get("onsets", []))
+                confidence = payload.get("confidence")
                 return BeatResult(
                     engine=str(payload.get("engine", "librosa")),
                     degraded=bool(payload.get("degraded", False)),
                     duration=float(payload.get("duration", 0.0)),
                     tempo=float(tempo) if tempo is not None else None,
-                    beats=tuple(float(b) for b in payload.get("beats", [])),
-                    onsets=tuple(float(o) for o in payload.get("onsets", [])),
+                    beats=beats,
+                    onsets=onsets,
+                    confidence=(
+                        float(confidence)
+                        if confidence is not None
+                        else _beat_confidence(beats, onsets)
+                    ),
                 )
             except (ValueError, TypeError):
                 pass  # unparseable stdout: fall through to the baseline
@@ -1469,6 +1496,7 @@ def detect_beats(
         tempo=tempo,
         beats=tuple(beats),
         onsets=tuple(onsets),
+        confidence=_beat_confidence(tuple(beats), tuple(onsets)),
     )
 
 
@@ -1481,6 +1509,7 @@ def detect_beats(
 # verdict is measured, not vibes. No decode happens here.
 # ---------------------------------------------------------------------------
 
+_MOTION_TRANSITION_MIN_DIFF = 0.5  # spec: transitions move content, not just histograms
 _SYNC_BASELINE_SHUFFLES = 40
 
 

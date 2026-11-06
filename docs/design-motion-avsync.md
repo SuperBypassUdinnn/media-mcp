@@ -73,9 +73,9 @@ Derived events from the energy curve:
 - **motion bursts**: contiguous spans where energy clears `k` times the
   rolling median (window ~5 s) — "the animation happens here";
 - **static holds**: spans near zero energy — safe keyframe points;
-- **gradual transitions**: sustained moderate frame-diff with sustained low
-  histogram correlation over >= 0.4 s — the crossfade/wipe signal `scdet`
-  cannot see;
+- **gradual transitions**: sustained moderate frame-diff (at least 0.5
+  levels — content actually changes) with sustained histogram travel over
+  >= 0.4 s — the crossfade/wipe signal `scdet` cannot see;
 - **keyframes**: local energy minima inside high-motion segments.
 
 Artifacts: `motion.json` (events + curve summary) in the source's cache
@@ -124,7 +124,11 @@ the A/V offset from `probe`:
   start), the distance to the nearest audio onset; report median, 90th
   percentile, and the share of cuts within a ±0.1 s tolerance. Compare
   against a shuffled-onsets baseline so a verdict of "synced" is measured,
-  not vibes.
+  not vibes. (Implementation: burst starts join the cut list, deduplicated
+  against scdet cuts within 0.25 s; a missing motion.json skips them with
+  a stated note. The offset algebra moves each onset to container time —
+  `onset + offset` — which is the spec's "subtract from cuts" under the
+  measured `audio.start_time - video.start_time` sign convention.)
 - **beat-phase of cuts**: circular mean of each cut's position within the
   beat grid (fraction of beat interval); near 0.0/1.0 means cuts land on
   beats.
@@ -196,5 +200,19 @@ librosa environment is absent.
 | D6 manifest integration | Deferred until the three tools are stable |
 | `media_frames(at="beats")` without cached beats | Error naming `media_beats`; no implicit decode |
 | Push 3 pending commits | Pushed to origin/main on 2026-11-06 |
+
+Implementation notes from the 2026-11-06 review pass:
+
+- **Confidence** (section 4): beat-onset agreement — the share of beats
+  with an onset within 70 ms — computed identically in both engines, so
+  the two environments stay self-contained.
+- **`MEDIA_RHYTHM_BIN`**: a server-side override seam (test + operator),
+  mirroring the transcription pipeline's `MEDIA_TRANSCRIBE_BIN`; the
+  wrapper itself deliberately ignores it.
+- **Burst floor 1.0 level** (section 3): keeps a nearly static clip's
+  encoding noise from flagging itself; the rolling median alone is too
+  generous on silent sources.
+- **`rhythm/setup.sh` interpreter fallback** (D2a): python3.11/python3
+  mirrors `transcribe/setup.sh`; CI pins 3.12, the binding path.
 
 
