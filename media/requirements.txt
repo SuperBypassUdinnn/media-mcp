@@ -1,10 +1,12 @@
 # Pinned environment for the MCP server and its test suite.
 #
-# Captured with `uv pip freeze --python media/.venv/bin/python` on 2026-10-26 from
-# the working venv, which uv 0.11.21 built on Python 3.14.6. The three direct
-# dependencies are mcp, pytest, and ruff; every other line is their transitive
-# closure. The interpreter version matters and cannot be pinned here, so the
-# rebuild names it.
+# Captured with `uv pip freeze --python media/.venv/bin/python` on 2026-11-06 from
+# the working venv, which uv 0.11.21 built on Python 3.14.6. The direct
+# dependencies are mcp, pytest, ruff, opencv-python-headless, and brisque
+# (the BRISQUE no-reference IQA metric behind media_image_quality; its
+# scikit-image/scipy/opencv closure is pinned line by line); every other
+# line is their transitive closure. The interpreter version matters and
+# cannot be pinned here, so the rebuild names it.
 #
 # Rebuild the virtualenv the documentation refers to:
 #   uv venv media/.venv --python 3.14
@@ -12,20 +14,30 @@
 annotated-types==0.8.0
 anyio==4.15.1
 attrs==26.1.0
+brisque==0.2.0
+certifi==2026.10.23
 cffi==2.1.1
+charset-normalizer==3.5.2
 click==8.5.0
 cryptography==50.0.2
 h11==0.16.0
 httpcore2==2.13.1
 httpx2==2.13.1
 idna==3.20
+imageio==2.38.1
 iniconfig==2.3.1
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
+lazy-loader==0.6
+libsvm-official==3.37.0
 mcp==2.3.0
 mcp-types==2.3.0
+networkx==3.7
+numpy==2.5.4
+opencv-python-headless==5.0.0.93
 opentelemetry-api==1.45.1
 packaging==26.3
+pillow==13.0.0
 pluggy==1.7.0
 pycparser==3.11
 pydantic==2.14.1
@@ -35,12 +47,16 @@ pyjwt==2.15.1
 pytest==9.1.1
 python-multipart==0.0.32
 referencing==0.37.0
+requests==2.34.2
 rpds-py==2026.9.1
 ruff==0.17.1
+scikit-image==0.26.0
+scipy==1.18.1
 sse-starlette==3.5.0
 starlette==1.8.0
+tifffile==2026.10.15
 truststore==0.10.5
 typing-extensions==4.16.0
 typing-inspection==0.4.4
+urllib3==2.8.0
 uvicorn==0.54.0
-brisque==0.2.0
