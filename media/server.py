@@ -2724,6 +2724,91 @@ def _motion_work(
     return "\n".join(lines)
 
 
+_RHYTHM_WRAPPER = Path(__file__).resolve().parent.parent / "rhythm" / "rhythm.sh"
+
+
+async def media_beats(source: str, identity: str = "sampled") -> str:
+    """Analyze a source's rhythm: onsets, tempo, and a beat grid.
+
+    The analysis is written to `beats.json` in the source's cache entry and
+    its path is named in the response so the result survives compaction.
+    """
+    return await _guarded(
+        lambda cancel: _beats_work(load_settings(), source, identity, cancel)
+    )
+
+
+def _beats_work(
+    settings: Settings, source: str, identity: str, cancel: threading.Event
+) -> str:
+    """Run rhythm detection, write beats.json, and render the summary."""
+    report = _Report()
+    resolved, path, entry, identity_note = _entry_for(
+        settings, source, identity, report
+    )
+    _record_identity_note(report, identity_note)
+    wrapper = Path(os.environ.get("MEDIA_RHYTHM_BIN") or _RHYTHM_WRAPPER)
+    result = media.detect_beats(path, wrapper=wrapper, scratch_dir=entry, cancel=cancel)
+    if result.degraded:
+        report.skipped["librosa"] = (
+            "rhythm virtualenv unavailable; the pure-numpy baseline ran "
+            "(weaker beat tracking). Build it with rhythm/setup.sh."
+        )
+    else:
+        report.computed.append("rhythm engine: librosa (rhythm/.venv)")
+    _write_json(
+        entry / "beats.json",
+        {
+            "engine": result.engine,
+            "degraded": result.degraded,
+            "duration": result.duration,
+            "tempo": result.tempo,
+            "beats": list(result.beats),
+            "onsets": list(result.onsets),
+            "source": resolved.source,
+        },
+    )
+    _record_entry(entry, resolved)
+    preview = ", ".join(f"{b:.3f}" for b in result.beats[:8])
+    onset_preview = ", ".join(f"{o:.3f}" for o in result.onsets[:8])
+    lines = [
+        "# media_beats",
+        "",
+        f"Source: {resolved.source}",
+        f"Identity: {resolved.kind} {resolved.key}",
+        (
+            f"Engine: {result.engine}"
+            + (" (degraded pure-numpy fallback)" if result.degraded else "")
+        ),
+        (
+            f"Tempo: {result.tempo:.1f} BPM"
+            if result.tempo is not None
+            else "Tempo: none detected"
+        ),
+        (
+            f"Onsets ({len(result.onsets)}): {onset_preview}"
+            + (" ..." if len(result.onsets) > 8 else "")
+            if result.onsets
+            else "Onsets: none"
+        ),
+        (
+            f"Beat grid ({len(result.beats)}): {preview}"
+            + (" ..." if len(result.beats) > 8 else "")
+            if result.beats
+            else "Beat grid: none"
+        ),
+        "",
+        f"Artifact: {entry / 'beats.json'}",
+        (
+            "Use media_frames(at='beats') to rasterize frames on this grid; "
+            "it reads the cached beats.json."
+        ),
+        "",
+        report.status(),
+    ]
+    return "\n".join(lines)
+
+
 async def media_cache(action: str = "list") -> str:
     """Report the artifact cache: entries, cap, dependencies, eviction."""
     return await _guarded(lambda cancel: _cache_work(load_settings(), action, cancel))
@@ -2808,6 +2893,16 @@ _TOOL_DESCRIPTIONS = {
         "where a motion-graphics video actually animates, then pull frames "
         "with media_frames."
     ),
+    "media_beats": (
+        "Analyze a media source's rhythm: onset times, tempo estimate, and a "
+        "beat grid. Runs the repository's rhythm/ pipeline (librosa in its "
+        "own Python 3.12 virtualenv) and falls back to a pure-numpy spectral "
+        "flux baseline marked `degraded` when that venv is missing — build "
+        "it once with rhythm/setup.sh. Writes beats.json in the source's "
+        "cache entry and names it in the response; media_frames(at='beats') "
+        "consumes the same file. Use it for AMV-style work: find the beat "
+        "grid, then pull frames on it."
+    ),
     "media_cache": (
         "Report the artifact cache: `list` shows the entry table, `stats` shows "
         "total_bytes against the cap plus the transcription dependency self-check, "
@@ -2836,6 +2931,7 @@ def build_server() -> MCPServer:
         media_image_quality,
         media_image_sort,
         media_motion,
+        media_beats,
         media_cache,
     ):
         server.tool(

@@ -1197,6 +1197,274 @@ def motion_events(
     return events
 
 
+# ---------------------------------------------------------------------------
+# Rhythm analysis: onsets, tempo, and the beat grid behind media_beats.
+#
+# The strong engine is the repository's rhythm/ pipeline (librosa in its own
+# virtualenv, invoked through rhythm/rhythm.sh, the transcribe/ pattern). The
+# pure-numpy baseline here is the fallback the grill-me verdict D2 requires:
+# mono PCM through one ffmpeg pass, spectral-flux onset envelope, adaptive
+# peak picking, autocorrelation tempo in the 60-180 BPM band, and a
+# phase-searched beat comb. It reports engine="numpy" with degraded=True so
+# callers can state plainly that the result did not come from librosa.
+# ---------------------------------------------------------------------------
+
+_BEAT_SAMPLE_RATE = 22050
+_BEAT_FRAME = 1024
+_BEAT_HOP = 512
+_BEAT_MIN_GAP_S = 0.1
+_BEAT_ONSET_K = 2.0
+_BEAT_BPM_RANGE = (60.0, 180.0)
+
+
+@dataclass(frozen=True)
+class BeatResult:
+    """One source's rhythm analysis, engine-honest.
+
+    `engine` names what produced the numbers (`"librosa"` through the
+    rhythm/ virtualenv, `"numpy"` through the baseline here), and `degraded`
+    is True exactly when the baseline ran — the grill-me D2 flag that lets a
+    response say "beat tracking is weaker than librosa-grade". `tempo` is
+    the estimated BPM or None when no reliable periodicity exists, `beats`
+    is the beat grid in seconds (empty without a tempo), and `onsets` is the
+    measured note-boundary list. Timestamps are sorted, finite, and clamped
+    to the decoded duration.
+    """
+
+    engine: str
+    degraded: bool
+    duration: float
+    tempo: float | None
+    beats: tuple[float, ...]
+    onsets: tuple[float, ...]
+
+
+def _decode_mono_pcm(
+    path: Path,
+    *,
+    scratch_dir: Path | None = None,
+    cancel: threading.Event | None = None,
+) -> np.ndarray:
+    """Decode `path`'s audio to mono float samples in [-1, 1).
+
+    One ffmpeg pass (`-vn -ac 1 -ar 22050 -f s16le`) writes the little-endian
+    samples to `<scratch_dir>/rhythm-pcm.s16le` (or a fresh temp directory
+    when `scratch_dir` is None) — a file, not stdout, because `run_child`
+    only decodes binary stdout in its stdin-feeding mode and a text pipe
+    would choke on raw PCM the way it chokes on raw video. The file is
+    deleted before returning. A source with no audio stream, a failed ffmpeg
+    run, or an empty decode raises `MediaError`.
+    """
+    import numpy as np
+
+    path = Path(path)
+    result = probe(path)
+    if not result.has_audio:
+        raise MediaError(f"rhythm analysis needs an audio stream; {path} has none")
+    scratch = Path(scratch_dir) if scratch_dir is not None else Path(tempfile.mkdtemp())
+    scratch.mkdir(parents=True, exist_ok=True)
+    pcm_path = scratch / "rhythm-pcm.s16le"
+    argv = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(_BEAT_SAMPLE_RATE),
+        "-f",
+        "s16le",
+        str(pcm_path),
+    ]
+    try:
+        done = run_child(argv, cancel=cancel)
+        if done.returncode != 0 or not pcm_path.is_file():
+            raise MediaError(
+                f"rhythm audio decode failed for {path}: ffmpeg exited "
+                f"{done.returncode}; captured stderr: {done.stderr.strip() or '(none)'}"
+            )
+        raw = pcm_path.read_bytes()
+        if not raw:
+            raise MediaError(f"rhythm audio decode of {path} produced no samples")
+        return np.frombuffer(raw, dtype=np.int16).astype(np.float64) / 32768.0
+    finally:
+        pcm_path.unlink(missing_ok=True)
+
+
+def _beat_envelope(pcm: np.ndarray) -> tuple[np.ndarray, float]:
+    """Spectral-flux onset envelope of `pcm` and the seconds per envelope bin.
+
+    Frames of `_BEAT_FRAME` samples hop `_BEAT_HOP` samples; each frame's
+    positive magnitude change against its predecessor sums into the flux.
+    The envelope carries one value per hop: `seconds_per_bin = hop / rate`.
+    """
+    import numpy as np
+
+    frame = _BEAT_FRAME
+    hop = _BEAT_HOP
+    if pcm.size < frame:
+        pcm = np.pad(pcm, (0, frame - pcm.size))
+    pad = frame - hop
+    padded = np.pad(pcm, (pad, 0))  # center the first window at sample zero
+    windows = np.lib.stride_tricks.sliding_window_view(padded, frame)[::hop]
+    spectrum = np.abs(np.fft.rfft(windows * np.hanning(frame), axis=1))
+    flux = np.clip(np.diff(spectrum, axis=0), 0, None).sum(axis=1)
+    flux = np.concatenate([[0.0], flux])
+    return flux, hop / _BEAT_SAMPLE_RATE
+
+
+def _onset_pick(envelope: np.ndarray, seconds_per_bin: float) -> list[float]:
+    """Adaptive peak picking on an onset envelope, returning seconds.
+
+    A bin is an onset when it is a local maximum and clears the envelope's
+    median plus `_BEAT_ONSET_K` scaled median absolute deviations — the
+    file's own baseline, so a quiet track keeps its onsets without a
+    user-set threshold. Peaks closer than `_BEAT_MIN_GAP_S` collapse into
+    the stronger one.
+    """
+    import numpy as np
+
+    if envelope.size < 3:
+        return []
+    values = envelope.astype(np.float64)
+    center = float(np.median(values))
+    spread = float(np.median(np.abs(values - center))) or 1e-9
+    threshold = center + _BEAT_ONSET_K * spread
+    candidates = [
+        index
+        for index in range(1, values.size - 1)
+        if values[index] > threshold
+        and values[index] >= values[index - 1]
+        and values[index] > values[index + 1]
+    ]
+    onsets: list[float] = []
+    for index in candidates:
+        moment = round(index * seconds_per_bin, 3)
+        if onsets and moment - onsets[-1] < _BEAT_MIN_GAP_S:
+            continue
+        onsets.append(moment)
+    return onsets
+
+
+def _tempo_autocorr(envelope: np.ndarray, seconds_per_bin: float) -> float | None:
+    """Estimate BPM from the onset envelope's autocorrelation, or None.
+
+    The envelope is mean-subtracted and half-wave-rectified, its linear
+    autocorrelation computed through an FFT, and the strongest lag inside
+    the 60-180 BPM band wins. A flat envelope (silence, unbroken noise)
+    autocorrelates to nothing distinctive; when the peak is not at least
+    three times the lag band's mean, no periodicity is claimed and the
+    caller gets None rather than a confident wrong number.
+    """
+    import numpy as np
+
+    values = envelope.astype(np.float64)
+    values = np.clip(values - values.mean(), 0, None)
+    if not values.any():
+        return None
+    size = 1 << (2 * values.size - 1).bit_length()
+    spectrum = np.fft.rfft(values, size)
+    autocorr = np.fft.irfft(spectrum * np.conjugate(spectrum), size)[: values.size]
+    lag_low = max(1, round(_BEAT_BPM_RANGE[1] ** -1 / seconds_per_bin))
+    lag_high = min(values.size - 1, round(_BEAT_BPM_RANGE[0] ** -1 / seconds_per_bin))
+    if lag_high <= lag_low:
+        return None
+    band = autocorr[lag_low : lag_high + 1]
+    best = int(np.argmax(band)) + lag_low
+    if band.max() <= 3.0 * band.mean():
+        return None
+    return round(60.0 / (best * seconds_per_bin), 2)
+
+
+def _beat_grid(onsets: list[float], tempo: float, duration: float) -> list[float]:
+    """Lay a comb grid at `tempo`, phase-locked to the onset density.
+
+    Every phase in [0, period) is scored by how many onsets sit within
+    50 ms of a grid tooth; the best phase lays beats for the whole
+    duration. This is deliberately simpler than a dynamic-programming
+    tracker — the degraded baseline's beat grid is a pacing reference, not
+    a transcription.
+    """
+    period = 60.0 / tempo
+    tolerance = 0.05
+    best_phase, best_score = 0.0, -1.0
+    steps = max(1, int(period / 0.01))
+    for step in range(steps):
+        phase = step * period / steps
+        score = 0
+        tooth = phase
+        while tooth < duration:
+            score += any(abs(o - tooth) <= tolerance for o in onsets)
+            tooth += period
+        if score > best_score:
+            best_phase, best_score = phase, score
+    if best_score <= 0:
+        return []
+    beats: list[float] = []
+    moment = best_phase
+    while moment < duration:
+        beats.append(round(moment, 3))
+        moment += period
+    return beats
+
+
+def detect_beats(
+    path: Path,
+    *,
+    wrapper: Path | None = None,
+    scratch_dir: Path | None = None,
+    cancel: threading.Event | None = None,
+) -> BeatResult:
+    """Analyze `path`'s rhythm, librosa first and the numpy baseline second.
+
+    When `wrapper` names an existing `rhythm/rhythm.sh`, one child runs it
+    and its JSON stdout becomes a librosa-grade `BeatResult`. Any failure
+    of that route — missing venv, non-zero exit, unparseable output — falls
+    back to the pure-numpy baseline with `degraded=True`, the grill-me D2
+    contract. `scratch_dir` receives the fallback's transient PCM file (the
+    source's cache entry in production). No wrapper, or a source without an
+    audio stream (an error either way), never silently pretends to be
+    librosa.
+    """
+    path = Path(path)
+    if wrapper is not None and Path(wrapper).is_file():
+        done = run_child(["bash", str(wrapper), str(path)], cancel=cancel)
+        if done.returncode == 0 and done.stdout.strip():
+            try:
+                payload = json.loads(done.stdout)
+                tempo = payload.get("tempo")
+                return BeatResult(
+                    engine=str(payload.get("engine", "librosa")),
+                    degraded=bool(payload.get("degraded", False)),
+                    duration=float(payload.get("duration", 0.0)),
+                    tempo=float(tempo) if tempo is not None else None,
+                    beats=tuple(float(b) for b in payload.get("beats", [])),
+                    onsets=tuple(float(o) for o in payload.get("onsets", [])),
+                )
+            except (ValueError, TypeError):
+                pass  # unparseable stdout: fall through to the baseline
+    pcm = _decode_mono_pcm(path, scratch_dir=scratch_dir, cancel=cancel)
+    duration = float(pcm.size / _BEAT_SAMPLE_RATE)
+    envelope, seconds_per_bin = _beat_envelope(pcm)
+    onsets = _onset_pick(envelope, seconds_per_bin)
+    tempo = _tempo_autocorr(envelope, seconds_per_bin)
+    beats = _beat_grid(onsets, tempo, duration) if tempo is not None else []
+    return BeatResult(
+        engine="numpy",
+        degraded=True,
+        duration=round(duration, 3),
+        tempo=tempo,
+        beats=tuple(beats),
+        onsets=tuple(onsets),
+    )
+
+
 def sample_candidates(
     scenes: list[SceneScore],
     duration: float,
