@@ -13,8 +13,11 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import subprocess
 import wave
 from pathlib import Path
+
+from mcp.server.mcpserver.exceptions import ToolError
 
 import media.server
 from media import media as media_mod
@@ -153,3 +156,59 @@ def test_media_beats_tool(tmp_path, monkeypatch):
     assert payload["degraded"] == (payload["engine"] == "numpy")
     _onsets_match(list(payload["onsets"]), tolerance=0.1)
     assert payload["source"] == str(path)
+
+
+def test_media_frames_at_beats(tmp_path, monkeypatch):
+    """media_frames(at='beats') rasterizes the cached grid; missing beats
+    is an error naming media_beats, never an implicit decode."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("MEDIA_CACHE_DIR", str(cache))
+    monkeypatch.setenv("MEDIA_RHYTHM_BIN", str(REPO_ROOT / "rhythm" / "rhythm.sh"))
+    video = tmp_path / "v.mp4"
+    clicks = tmp_path / "clicks.wav"
+    _write_click_track(clicks, bpm=120.0)
+    done = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=gray:size=320x240:rate=25:d=10",
+            "-i",
+            str(clicks),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(video),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    try:
+        asyncio.run(media.server.media_frames(str(video), at="beats"))
+    except ToolError as error:
+        assert "media_beats" in str(error)
+    else:
+        raise AssertionError("at='beats' without beats.json must error naming it")
+    asyncio.run(media.server.media_beats(str(video)))
+    result = asyncio.run(media.server.media_frames(str(video), at="beats"))
+    assert "# media_frames" in result
+    assert "Timestamps:" in result
+    pngs = list(cache.rglob("frames/*.png"))
+    assert pngs, result

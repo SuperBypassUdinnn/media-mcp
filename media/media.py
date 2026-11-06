@@ -1211,7 +1211,7 @@ def motion_events(
 
 _BEAT_SAMPLE_RATE = 22050
 _BEAT_FRAME = 1024
-_BEAT_HOP = 512
+_BEAT_HOP = 256
 _BEAT_MIN_GAP_S = 0.1
 _BEAT_ONSET_K = 2.0
 _BEAT_BPM_RANGE = (60.0, 180.0)
@@ -1371,14 +1371,21 @@ def _tempo_autocorr(envelope: np.ndarray, seconds_per_bin: float) -> float | Non
     size = 1 << (2 * values.size - 1).bit_length()
     spectrum = np.fft.rfft(values, size)
     autocorr = np.fft.irfft(spectrum * np.conjugate(spectrum), size)[: values.size]
-    lag_low = max(1, round(_BEAT_BPM_RANGE[1] ** -1 / seconds_per_bin))
-    lag_high = min(values.size - 1, round(_BEAT_BPM_RANGE[0] ** -1 / seconds_per_bin))
+    lag_low = max(1, round((60.0 / _BEAT_BPM_RANGE[1]) / seconds_per_bin))
+    lag_high = min(
+        values.size - 1, round((60.0 / _BEAT_BPM_RANGE[0]) / seconds_per_bin)
+    )
     if lag_high <= lag_low:
         return None
     band = autocorr[lag_low : lag_high + 1]
-    best = int(np.argmax(band)) + lag_low
     if band.max() <= 3.0 * band.mean():
         return None
+    # Duple preference: click tracks and beat grids autocorrelate strongly at
+    # every metric level, so the band often peaks as hard at the half tempo
+    # as at the true one. Among lags scoring within 90% of the peak, the
+    # shortest wins - the fastest tempo the evidence still supports.
+    strong = np.flatnonzero(band >= 0.9 * band.max())
+    best = int(strong[0]) + lag_low
     return round(60.0 / (best * seconds_per_bin), 2)
 
 

@@ -413,10 +413,10 @@ def validate_window(at: object, window: object) -> float | None:
             "window requires a single timestamp, so it cannot be combined with a "
             f"list of timestamps or with no timestamp (at={at!r})"
         )
-    if isinstance(at, str) and at.strip().lower() == "scenes":
+    if isinstance(at, str) and at.strip().lower() in {"scenes", "beats"}:
         raise MediaError(
             "window requires a single timestamp, so it cannot be combined with "
-            "at='scenes'"
+            f"at='{at.strip().lower()}'"
         )
     return span
 
@@ -1849,6 +1849,17 @@ def _frames_work(
             entry, path, result, SCENE_THRESHOLD_DEFAULT, count_value, report
         )[:count_value]
         default_tile = "sheet"
+    elif isinstance(at, str) and at.strip().lower() == "beats":
+        beats_path = entry / "beats.json"
+        data = _read_json(beats_path)
+        if not isinstance(data, dict) or not data.get("beats"):
+            raise MediaError(
+                f"at='beats' needs {beats_path} from a media_beats run; run "
+                "media_beats on this source first (no implicit audio decode)"
+            )
+        report.cached.append("beats.json")
+        stamps = [float(b) for b in data["beats"]][:count_value]
+        default_tile = "sheet"
     elif isinstance(at, (list, tuple)):
         stamps = _requested_timestamps(
             at, span, fps_value, result.duration, count_value
@@ -2978,11 +2989,13 @@ _TOOL_DESCRIPTIONS = {
         "Write PNG stills for the timestamps in `at`, returning the absolute "
         "paths. `at` is a list of timestamps, one timestamp, or the literal "
         "'scenes' (the default, which returns one contact sheet of the ranked "
-        "scene candidates). `window` samples a span around one timestamp at "
-        "`fps`; `tile` chooses sheet (grid), filmstrip (vertical stack), or "
-        "individual (one file per timestamp). Point the `read` tool at the "
-        "returned paths to view them. `image_inline=true` also attaches each "
-        "returned PNG (at most 8) as image content."
+        "scene candidates) or 'beats' (one still per cached beat grid from "
+        "media_beats; a missing beats.json is an error naming it). `window` "
+        "samples a span around one timestamp at `fps`; `tile` chooses sheet "
+        "(grid), filmstrip (vertical stack), or individual (one file per "
+        "timestamp). Point the `read` tool at the returned paths to view "
+        "them. `image_inline=true` also attaches each returned PNG (at most "
+        "8) as image content."
     ),
     "media_ocr": (
         "Recognize on-screen text at the timestamps in `at` and return it per "

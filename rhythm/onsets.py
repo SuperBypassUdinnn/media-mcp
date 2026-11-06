@@ -31,10 +31,46 @@ def main() -> int:
     # a stdout that must stay pure JSON, so they are suppressed wholesale.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
         import librosa
         import numpy as np
 
-        y, sr = librosa.load(path, mono=True)
+        # libsndfile (librosa's default reader) cannot decode compressed
+        # containers such as mp4/aac, so every source goes through one ffmpeg
+        # pass into a temp wav first; that also makes the engine's accepted
+        # inputs identical to the numpy baseline's.
+        with tempfile.TemporaryDirectory() as scratch:
+            wav = Path(scratch) / "rhythm-in.wav"
+            done = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    path,
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "22050",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(wav),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if done.returncode != 0:
+                print(done.stderr.strip() or "ffmpeg decode failed", file=sys.stderr)
+                return 1
+            y, sr = librosa.load(str(wav), sr=None, mono=True)
         duration = float(len(y) / sr)
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
         onsets = librosa.onset.onset_detect(
