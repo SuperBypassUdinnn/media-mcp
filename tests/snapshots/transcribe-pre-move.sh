@@ -16,7 +16,7 @@
 # runs isolates the wrapper change rather than the pipeline.
 set -euo pipefail
 
-PIPELINE_DIR="$HOME/.clone/Github/media-mcp/transcribe"
+PIPELINE_DIR="$HOME/.clone/Github/SuperBypassUdinnn/media-mcp/transcribe"
 VENV="$PIPELINE_DIR/.venv"
 PY="$VENV/bin/python"
 TRANSCRIBE="$PIPELINE_DIR/transcribe.py"

@@ -92,6 +92,23 @@ def _write_checkerboard(path: Path, width: int, height: int) -> None:
     cv2.imwrite(str(path), img)
 
 
+def _write_noisy_png(path: Path, width: int, height: int) -> None:
+    """Fine mid-gray noise: high blur score, good brightness and contrast.
+
+    The checkerboard's gray std (~100) is "poor" contrast, so tests that need
+    an image classified ``good`` overall use this instead: single-channel
+    uniform noise in [70, 190) replicated to BGR has brightness ~130, gray
+    std ~35, and large Laplacian variance. Deterministic via a fixed seed.
+    """
+    import numpy as np
+
+    cv2 = __import__("cv2")
+    rng = np.random.default_rng(42)
+    gray = rng.uniform(70, 190, size=(height, width)).astype(np.uint8)
+    img = np.stack([gray, gray, gray], axis=-1)
+    cv2.imwrite(str(path), img)
+
+
 def _tier_of(result: str) -> str:
     for line in result.splitlines():
         if line.startswith("Quality tier:"):
@@ -288,3 +305,58 @@ def test_media_image_sort_filters_by_min_quality(tmp_path, monkeypatch):
     assert "Kept:" in result
     # The blurred image is poor and should be filtered out by min_quality=good.
     assert str(blurred) not in result, result
+
+
+def test_media_image_sort_writes_default_artifact(tmp_path, monkeypatch):
+    """The ranking is saved under <cache>/sorts/ and named in the response."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("MEDIA_CACHE_DIR", str(cache))
+    sharp = tmp_path / "sharp.png"
+    blurred = tmp_path / "blurred.png"
+    _write_checkerboard(sharp, 300, 300)
+    _write_blurred_png(blurred, 300, 300)
+    result = asyncio.run(
+        media.server.media_image_sort([str(sharp), str(blurred)], by="blur")
+    )
+    artifact_line = next(
+        line for line in result.splitlines() if line.startswith("Artifact: ")
+    )
+    artifact = Path(artifact_line.split(": ", 1)[1])
+    assert artifact.exists()
+    assert cache in artifact.parents
+    payload = json.loads(artifact.read_text())
+    assert payload["tool"] == "media_image_sort"
+    assert payload["params"]["by"] == "blur"
+    assert payload["summary"] == {"total": 2, "kept": 2}
+    assert [row["source"] for row in payload["kept"]] == [str(sharp), str(blurred)]
+    assert all(row["kept"] is True for row in payload["kept"])
+    assert payload["filtered"] == []
+
+
+def test_media_image_sort_writes_explicit_output(tmp_path, monkeypatch):
+    """`output` writes the ranking to that exact path."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("MEDIA_CACHE_DIR", str(cache))
+    good = tmp_path / "good.png"
+    blurred = tmp_path / "blurred.png"
+    _write_noisy_png(good, 300, 300)
+    _write_blurred_png(blurred, 300, 300)
+    output = tmp_path / "reports" / "ranking.json"
+    result = asyncio.run(
+        media.server.media_image_sort(
+            [str(good), str(blurred)],
+            by="quality",
+            order="desc",
+            min_quality="good",
+            output=str(output),
+        )
+    )
+    assert f"Artifact: {output}" in result
+    assert output.exists()
+    payload = json.loads(output.read_text())
+    assert payload["summary"] == {"total": 2, "kept": 1}
+    assert [row["source"] for row in payload["kept"]] == [str(good)]
+    assert [row["source"] for row in payload["filtered"]] == [str(blurred)]
+    assert payload["filtered"][0]["kept"] is False

@@ -2436,11 +2436,17 @@ async def media_image_sort(
     order: str = "desc",
     min_quality: str | None = None,
     identity: str = "sampled",
+    output: str | None = None,
 ) -> str:
-    """Rank a list of images by a quality metric, with optional filtering."""
+    """Rank a list of images by a quality metric, with optional filtering.
+
+    The ranking is also written to a JSON file — `output` when given, or a
+    timestamped file under ``<cache>/sorts/`` by default — so the result
+    survives conversation compaction. The response names the artifact path.
+    """
     return await _guarded(
         lambda cancel: _sort_work(
-            load_settings(), sources, by, order, min_quality, identity, cancel
+            load_settings(), sources, by, order, min_quality, identity, cancel, output
         )
     )
 
@@ -2513,6 +2519,7 @@ def _sort_work(
     min_quality: str | None,
     identity: str,
     cancel: threading.Event,
+    output: str | None = None,
 ) -> str:
     """Rank a list of images by a quality metric, with optional filtering."""
     report = _Report()
@@ -2563,6 +2570,31 @@ def _sort_work(
         keyfn = lambda r: r["metrics"]["resolution"]
     kept.sort(key=keyfn, reverse=(order == "desc"))
 
+    # Write the ranking to a durable JSON file so the result survives
+    # conversation compaction: `output` when given, otherwise a timestamped
+    # file under <cache>/sorts/. The response names the path either way.
+    kept_keys = {r["key"] for r in kept}
+    payload = {
+        "tool": "media_image_sort",
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "params": {"by": by, "order": order, "min_quality": min_quality},
+        "kept": [dict(r, kept=True) for r in kept],
+        "filtered": [dict(r, kept=False) for r in results if r["key"] not in kept_keys],
+        "summary": {"total": len(results), "kept": len(kept)},
+    }
+    if output:
+        artifact = Path(output).expanduser().resolve()
+    else:
+        sorts_dir = settings.cache_dir / "sorts"
+        artifact = sorts_dir / f"image-sort-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        stem = artifact.stem
+        counter = 1
+        while artifact.exists():
+            artifact = sorts_dir / f"{stem}-{counter}.json"
+            counter += 1
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(artifact, payload)
+
     lines = ["# media_image_sort", "", f"Sort: by={by} order={order}"]
     if min_quality:
         lines.append(f"Min quality: {min_quality}")
@@ -2575,8 +2607,16 @@ def _sort_work(
             f"blur={m['blur_score']} brightness={m['brightness']} "
             f"contrast={m['contrast']} {m['width']}x{m['height']}"
         )
-    lines.append("")
-    lines.append(report.status())
+    lines += [
+        "",
+        f"Artifact: {artifact}",
+        (
+            "The full ranking (metrics per image, kept and filtered) is saved "
+            "there; re-read it after any context compaction."
+        ),
+        "",
+        report.status(),
+    ]
     return "\n".join(lines)
 
 
@@ -2646,7 +2686,10 @@ _TOOL_DESCRIPTIONS = {
         "blur, brightness, contrast, size, resolution, or ``quality`` (the tier "
         "plus blur as tie-break, default); `order` is ``desc`` or ``asc``; "
         "`min_quality`` (``poor``/``fair``/``good``) drops everything below it. "
-        "Returns the kept images ranked, so you can quickly discard bad photos."
+        "Returns the kept images ranked, so you can quickly discard bad photos. "
+        "Also writes the full ranking to a JSON file — `output` path when given, "
+        "or a timestamped file under <cache>/sorts/ by default — and names that "
+        "path in the response so the result survives context compaction."
     ),
     "media_cache": (
         "Report the artifact cache: `list` shows the entry table, `stats` shows "
