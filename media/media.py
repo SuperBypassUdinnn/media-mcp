@@ -1218,6 +1218,29 @@ _BEAT_BPM_RANGE = (60.0, 180.0)
 
 
 @dataclass(frozen=True)
+class BeatDetail:
+    """Analytical breakdown of a single beat in the audio timeline.
+
+    `t` is the beat timestamp in media seconds. `strength` is the normalized
+    local onset energy (0.0 to 1.0). `band` is the dominant spectral band:
+    `"low"` (< 150 Hz), `"mid"` (150-2500 Hz), or `"high"` (> 2500 Hz).
+    `is_downbeat` is True when the beat is inferred as the first beat of a
+    4/4 bar, `bar_index` is the zero-based bar index along the timeline, and
+    `beat_in_bar` is the 1-based beat number within the bar (1..4).
+    `phrase_energy` is the moving-window average of beat strengths over an
+    8-beat symmetric window, normalized to [0.0, 1.0].
+    """
+
+    t: float
+    strength: float
+    band: str
+    is_downbeat: bool
+    bar_index: int
+    beat_in_bar: int
+    phrase_energy: float
+
+
+@dataclass(frozen=True)
 class BeatResult:
     """One source's rhythm analysis, engine-honest.
 
@@ -1227,8 +1250,9 @@ class BeatResult:
     response say "beat tracking is weaker than librosa-grade". `tempo` is
     the estimated BPM or None when no reliable periodicity exists, `beats`
     is the beat grid in seconds (empty without a tempo), and `onsets` is the
-    measured note-boundary list. Timestamps are sorted, finite, and clamped
-    to the decoded duration.
+    measured note-boundary list. `beat_details` carries per-beat band,
+    downbeat, and phrase-energy metadata. Timestamps are sorted, finite, and
+    clamped to the decoded duration.
     """
 
     engine: str
@@ -1238,6 +1262,7 @@ class BeatResult:
     beats: tuple[float, ...]
     onsets: tuple[float, ...]
     confidence: float | None
+    beat_details: tuple[BeatDetail, ...] = ()
 
 
 def _decode_mono_pcm(
@@ -1298,12 +1323,16 @@ def _decode_mono_pcm(
         pcm_path.unlink(missing_ok=True)
 
 
-def _beat_envelope(pcm: np.ndarray) -> tuple[np.ndarray, float]:
-    """Spectral-flux onset envelope of `pcm` and the seconds per envelope bin.
+def _beat_envelope(pcm: np.ndarray) -> tuple[np.ndarray, float, tuple[np.ndarray, ...]]:
+    """Spectral-flux onset envelope of `pcm` and per-band flux envelopes.
 
     Frames of `_BEAT_FRAME` samples hop `_BEAT_HOP` samples; each frame's
     positive magnitude change against its predecessor sums into the flux.
     The envelope carries one value per hop: `seconds_per_bin = hop / rate`.
+    The STFT spectrum (513 bins at 22050 Hz, ~21.53 Hz per bin) is split
+    into three musical bands: low `0:7` (< 150 Hz), mid `7:117`
+    (150-2500 Hz), and high `117:513` (> 2500 Hz), each reduced to its own
+    spectral-flux envelope.
     """
     import numpy as np
 
@@ -1315,9 +1344,13 @@ def _beat_envelope(pcm: np.ndarray) -> tuple[np.ndarray, float]:
     padded = np.pad(pcm, (pad, 0))  # center the first window at sample zero
     windows = np.lib.stride_tricks.sliding_window_view(padded, frame)[::hop]
     spectrum = np.abs(np.fft.rfft(windows * np.hanning(frame), axis=1))
-    flux = np.clip(np.diff(spectrum, axis=0), 0, None).sum(axis=1)
-    flux = np.concatenate([[0.0], flux])
-    return flux, hop / _BEAT_SAMPLE_RATE
+    band_slices = (spectrum[:, 0:7], spectrum[:, 7:117], spectrum[:, 117:513])
+    band_fluxes = tuple(
+        np.concatenate([[0.0], np.clip(np.diff(b, axis=0), 0, None).sum(axis=1)])
+        for b in band_slices
+    )
+    flux = band_fluxes[0] + band_fluxes[1] + band_fluxes[2]
+    return flux, hop / _BEAT_SAMPLE_RATE, band_fluxes
 
 
 def _onset_pick(envelope: np.ndarray, seconds_per_bin: float) -> list[float]:
@@ -1440,6 +1473,85 @@ def _beat_confidence(
     return round(hits / len(beats), 3)
 
 
+def _beat_bin(seconds: float, seconds_per_bin: float, n_bins: int) -> int:
+    """Clamp a media timestamp to the nearest valid envelope bin index."""
+    return min(max(round(seconds / seconds_per_bin), 0), n_bins - 1)
+
+
+def _beat_details(
+    beats: tuple[float, ...],
+    band_fluxes: tuple[np.ndarray, ...],
+    seconds_per_bin: float,
+) -> tuple[BeatDetail, ...]:
+    """Per-beat strength, dominant band, 4/4 downbeat phase, and phrase energy.
+
+    Strength is the summed band energy at the beat, scaled to [0, 1] against
+    the 98th percentile. The dominant band is the channel with the highest
+    ratio above its own median noise floor. The downbeat phase maximizes the
+    ratio of low-band energy on candidate downbeats versus off-beats; bars are
+    then indexed from that phase in 4/4 meter. Phrase energy is the 8-beat
+    symmetric moving average of strength, normalized to [0, 1].
+    """
+    import numpy as np
+
+    if not beats:
+        return ()
+    low, mid, high = band_fluxes
+    bands = (low, mid, high)
+    band_names = ("low", "mid", "high")
+    n_bins = low.size
+    n = len(beats)
+
+    def sample(band: np.ndarray, t: float) -> float:
+        return float(band[_beat_bin(t, seconds_per_bin, n_bins)])
+
+    floors = [float(np.median(b)) + 1e-9 for b in bands]
+    totals = np.array(
+        [sum(sample(b, t) for b in bands) for t in beats], dtype=np.float64
+    )
+    scale = float(np.percentile(totals, 98)) or 1.0
+    strengths = np.clip(totals / scale, 0.0, 1.0)
+
+    band_idxs = [
+        int(np.argmax([sample(b, t) / floors[bi] for bi, b in enumerate(bands)]))
+        for t in beats
+    ]
+
+    low_strengths = np.array([sample(low, t) for t in beats], dtype=np.float64)
+    best_phase, best_score = 0, -1.0
+    for p in range(4):
+        mask = np.arange(n) % 4 == p
+        score = float(low_strengths[mask].sum()) / (
+            float(low_strengths[~mask].sum()) + 1e-9
+        )
+        if score > best_score:
+            best_score, best_phase = score, p
+
+    half = 4
+    phrase = np.array(
+        [strengths[max(0, i - half) : min(n, i + half + 1)].mean() for i in range(n)],
+        dtype=np.float64,
+    )
+    phrase /= float(phrase.max()) or 1.0
+
+    details = []
+    for i, t in enumerate(beats):
+        beat_in_bar = ((i - best_phase) % 4) + 1
+        bar_index = (i - best_phase) // 4
+        details.append(
+            BeatDetail(
+                t=round(float(t), 3),
+                strength=round(float(strengths[i]), 3),
+                band=band_names[band_idxs[i]],
+                is_downbeat=bool(beat_in_bar == 1),
+                bar_index=int(bar_index),
+                beat_in_bar=int(beat_in_bar),
+                phrase_energy=round(float(phrase[i]), 3),
+            )
+        )
+    return tuple(details)
+
+
 def detect_beats(
     path: Path,
     *,
@@ -1468,6 +1580,19 @@ def detect_beats(
                 beats = tuple(float(b) for b in payload.get("beats", []))
                 onsets = tuple(float(o) for o in payload.get("onsets", []))
                 confidence = payload.get("confidence")
+                details_payload = payload.get("beat_details", [])
+                beat_details = tuple(
+                    BeatDetail(
+                        t=float(d.get("t", 0.0)),
+                        strength=float(d.get("strength", 0.0)),
+                        band=str(d.get("band", "mid")),
+                        is_downbeat=bool(d.get("is_downbeat", False)),
+                        bar_index=int(d.get("bar_index", 0)),
+                        beat_in_bar=int(d.get("beat_in_bar", 1)),
+                        phrase_energy=float(d.get("phrase_energy", 0.0)),
+                    )
+                    for d in details_payload
+                )
                 return BeatResult(
                     engine=str(payload.get("engine", "librosa")),
                     degraded=bool(payload.get("degraded", False)),
@@ -1480,15 +1605,17 @@ def detect_beats(
                         if confidence is not None
                         else _beat_confidence(beats, onsets)
                     ),
+                    beat_details=beat_details,
                 )
             except (ValueError, TypeError):
                 pass  # unparseable stdout: fall through to the baseline
     pcm = _decode_mono_pcm(path, scratch_dir=scratch_dir, cancel=cancel)
     duration = float(pcm.size / _BEAT_SAMPLE_RATE)
-    envelope, seconds_per_bin = _beat_envelope(pcm)
+    envelope, seconds_per_bin, band_fluxes = _beat_envelope(pcm)
     onsets = _onset_pick(envelope, seconds_per_bin)
     tempo = _tempo_autocorr(envelope, seconds_per_bin)
     beats = _beat_grid(onsets, tempo, duration) if tempo is not None else []
+    beat_details = _beat_details(tuple(beats), band_fluxes, seconds_per_bin)
     return BeatResult(
         engine="numpy",
         degraded=True,
@@ -1497,6 +1624,7 @@ def detect_beats(
         beats=tuple(beats),
         onsets=tuple(onsets),
         confidence=_beat_confidence(tuple(beats), tuple(onsets)),
+        beat_details=beat_details,
     )
 
 

@@ -102,6 +102,118 @@ def test_detect_beats_numpy_fallback_is_flagged(tmp_path, monkeypatch):
         assert 100 <= result.tempo <= 140
 
 
+def _write_single_band_track(path: Path, freq: float) -> Path:
+    """Mono WAV: one click per beat at 120 BPM, all at `freq` (first click at t=0.5 s)."""
+    total = int(RATE * CLICK_SECONDS)
+    samples = [0.0] * total
+    interval = 60.0 / 120.0
+    click_len = 400
+    for beat in range(int(CLICK_SECONDS / interval)):
+        start = int((beat + 1) * interval * RATE)
+        for index in range(click_len):
+            if start + index >= total:
+                break
+            envelope = math.exp(-8.0 * index / click_len)
+            samples[start + index] += (
+                0.9 * envelope * math.sin(2 * math.pi * freq * index / RATE)
+            )
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(RATE)
+        handle.writeframes(
+            b"".join(
+                int(max(-1.0, min(1.0, s)) * 32767).to_bytes(2, "little", signed=True)
+                for s in samples
+            )
+        )
+    return path
+
+
+def _write_accented_click_track(path: Path) -> Path:
+    """16-beat click track at 120 BPM with beat 1 of each bar accented (louder)."""
+    total = int(RATE * CLICK_SECONDS)
+    samples = [0.0] * total
+    interval = 60.0 / 120.0
+    click_len = 400
+    for beat in range(int(CLICK_SECONDS / interval)):
+        start = int(beat * interval * RATE)
+        amp = 1.0 if beat % 4 == 0 else 0.4
+        for index in range(click_len):
+            if start + index >= total:
+                break
+            envelope = math.exp(-8.0 * index / click_len)
+            samples[start + index] += (
+                amp * envelope * math.sin(2 * math.pi * 1000 * index / RATE)
+            )
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(RATE)
+        handle.writeframes(
+            b"".join(
+                int(max(-1.0, min(1.0, s)) * 32767).to_bytes(2, "little", signed=True)
+                for s in samples
+            )
+        )
+    return path
+
+
+def test_beat_details_frequency_bands(tmp_path):
+    """80 Hz clicks classify as ``low`` and 5 kHz clicks classify as ``high``."""
+    wrapper = REPO_ROOT / "rhythm" / "rhythm.sh"
+    for freq, expected in ((80.0, "low"), (5000.0, "high")):
+        path = _write_single_band_track(tmp_path / f"{freq}.wav", freq)
+        result = media_mod.detect_beats(path, wrapper=wrapper)
+        assert result.engine in {"librosa", "numpy"}
+        details = list(result.beat_details)
+        assert details, "beat_details must be non-empty"
+        for detail in details:
+            if detail.strength > 0:
+                assert detail.band == expected, (freq, detail.band, detail.t)
+
+
+def test_downbeat_detection_4_4(tmp_path):
+    """Accented beat-1 clicks align the 4/4 downbeat phase every four beats."""
+    wrapper = REPO_ROOT / "rhythm" / "rhythm.sh"
+    path = _write_accented_click_track(tmp_path / "accented.wav")
+    result = media_mod.detect_beats(path, wrapper=wrapper)
+    assert result.engine in {"librosa", "numpy"}
+    details = list(result.beat_details)
+    assert details, "beat_details must be non-empty"
+    downbeats = [i for i, d in enumerate(details) if d.is_downbeat]
+    assert downbeats, "at least one downbeat must be inferred"
+    # Downbeats recur every four beats and beat_in_bar cycles 1..4.
+    for index in range(1, len(downbeats)):
+        assert downbeats[index] - downbeats[index - 1] == 4, downbeats
+    for index, detail in enumerate(details):
+        assert detail.beat_in_bar in {1, 2, 3, 4}
+        expected_bar = (index - downbeats[0]) // 4
+        assert detail.bar_index == expected_bar, (index, detail.bar_index, expected_bar)
+        expected_beat = ((index - downbeats[0]) % 4) + 1
+        assert detail.beat_in_bar == expected_beat, (
+            index,
+            detail.beat_in_bar,
+            expected_beat,
+        )
+        assert detail.is_downbeat == (expected_beat == 1)
+
+
+def test_numpy_fallback_emits_beat_details(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEDIA_RHYTHM_BIN", "/nonexistent/rhythm.sh")
+    path = _write_click_track(tmp_path / "clicks.wav")
+    result = media_mod.detect_beats(path, wrapper=Path("/nonexistent/rhythm.sh"))
+    assert result.engine == "numpy"
+    assert result.degraded is True
+    details = list(result.beat_details)
+    assert details, "fallback must emit beat_details"
+    for detail in details:
+        assert detail.band in {"low", "mid", "high"}
+        assert 0.0 <= detail.strength <= 1.0
+        assert 0.0 <= detail.phrase_energy <= 1.0
+        assert detail.beat_in_bar in {1, 2, 3, 4}
+
+
 def test_detect_beats_requires_audio(tmp_path):
     video_only = tmp_path / "silent.mp4"
     import subprocess
