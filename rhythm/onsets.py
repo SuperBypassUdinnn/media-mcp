@@ -38,7 +38,6 @@ def main() -> int:
         from pathlib import Path
 
         import librosa
-        import numpy as np
 
         # libsndfile (librosa's default reader) cannot decode compressed
         # containers such as mp4/aac, so every source goes through one ffmpeg
@@ -112,7 +111,6 @@ def main() -> int:
 def _band_channels(sr: float, n_fft: int = 2048) -> list[slice]:
     """FFT-frequency slices for low (<150 Hz), mid (150-2500 Hz), high (>2500 Hz)."""
     import librosa
-    import numpy as np
 
     freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
     idx_150 = int(np.argmax(freqs >= 150.0)) if (freqs >= 150.0).any() else len(freqs)
@@ -129,72 +127,96 @@ def _compute_beat_details(beat_times: list[float], y: np.ndarray, sr: float) -> 
     caller can serialize them directly into the JSON payload.
     """
     import librosa
-    import numpy as np
 
     if not beat_times:
         return []
     hop_length = 512
     n_fft = 2048
     stft = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop_length))
-    S = librosa.amplitude_to_db(stft)
     band_envs = librosa.onset.onset_strength_multi(
-        S=S,
+        S=stft,
         sr=sr,
         hop_length=hop_length,
         channels=_band_channels(sr, n_fft),
+        aggregate=np.sum,
+        center=False,
     )
     band_names = ("low", "mid", "high")
     n_frames = band_envs.shape[1]
-    bands = (band_envs[0], band_envs[1], band_envs[2])
-    floors = [float(np.median(b)) + 1e-9 for b in bands]
+    n = len(beat_times)
     times = np.array(beat_times, dtype=np.float64)
     frames = np.clip(
         librosa.time_to_frames(times, sr=sr, hop_length=hop_length), 0, n_frames - 1
     )
+    # Sample local max within ~60 ms around each beat frame to absorb grid jitter.
+    radius = max(1, round(0.06 * sr / hop_length))
 
-    def sample(band: np.ndarray, frame: int) -> float:
-        return float(band[frame])
-
-    totals = np.array(
+    band_vals = np.array(
         [
-            sum(sample(bands[bi], frames[i]) for bi in range(3))
-            for i in range(len(beat_times))
+            [
+                float(
+                    band_envs[
+                        bi, max(0, int(f) - radius) : min(n_frames, int(f) + radius + 1)
+                    ].max()
+                )
+                for bi in range(3)
+            ]
+            for f in frames
         ],
         dtype=np.float64,
     )
+
+    band_medians = np.median(band_envs, axis=1)
+    excess = np.maximum(0.0, band_vals - band_medians)
+    active = excess if float(excess.max()) > 0.0 else band_vals
+
+    totals = active.sum(axis=1)
     scale = float(np.percentile(totals, 98)) or 1.0
     strengths = np.clip(totals / scale, 0.0, 1.0)
 
     band_idxs = [
-        int(np.argmax([sample(bands[bi], frames[i]) / floors[bi] for bi in range(3)]))
-        for i in range(len(beat_times))
+        int(np.argmax(active[i]))
+        if float(active[i].max()) > 0.0
+        else int(np.argmax(band_vals[i]))
+        for i in range(n)
     ]
 
-    low_strengths = np.array(
-        [sample(bands[0], frames[i]) for i in range(len(beat_times))],
-        dtype=np.float64,
-    )
-    n = len(beat_times)
+    # Downbeat phase: favor low-band impact combined with total strength; fall
+    # back to total strength alone when the track has negligible sub-bass.
+    low_vals = active[:, 0]
+    low_scale = float(np.percentile(low_vals, 98))
+    if low_scale > 0.0 and low_scale >= 0.05 * scale:
+        low_norm = np.clip(low_vals / low_scale, 0.0, 1.0)
+        downbeat_energy = 0.7 * low_norm + 0.3 * strengths
+    else:
+        downbeat_energy = strengths
+
     best_phase, best_score = 0, -1.0
-    for p in range(4):
-        mask = np.arange(n) % 4 == p
-        score = float(low_strengths[mask].sum()) / (
-            float(low_strengths[~mask].sum()) + 1e-9
-        )
+    indices = np.arange(n)
+    for p in range(min(4, n)):
+        mask = indices % 4 == p
+        if not mask.any():
+            continue
+        on_mean = float(downbeat_energy[mask].mean())
+        off_mean = float(downbeat_energy[~mask].mean()) if (~mask).any() else 0.0
+        score = on_mean / (off_mean + 1e-9)
         if score > best_score:
             best_score, best_phase = score, p
 
-    half = 4
+    # 8-beat moving window average: [i - 4, i + 4) -> up to 8 beats.
     phrase = np.array(
-        [strengths[max(0, i - half) : min(n, i + half + 1)].mean() for i in range(n)],
+        [strengths[max(0, i - 4) : min(n, i + 4)].mean() for i in range(n)],
         dtype=np.float64,
     )
     phrase /= float(phrase.max()) or 1.0
 
+    # Keep bar_index non-negative: pickup beats before best_phase live in bar 0
+    # and the first full bar starts at bar 1 (or bar 0 when best_phase == 0).
+    bar_offset = 1 if best_phase > 0 else 0
     details = []
     for i, t in enumerate(beat_times):
         beat_in_bar = ((i - best_phase) % 4) + 1
-        bar_index = (i - best_phase) // 4
+        bar_index = (i - best_phase) // 4 + bar_offset
         details.append(
             {
                 "t": round(float(t), 3),

@@ -1485,12 +1485,17 @@ def _beat_details(
 ) -> tuple[BeatDetail, ...]:
     """Per-beat strength, dominant band, 4/4 downbeat phase, and phrase energy.
 
-    Strength is the summed band energy at the beat, scaled to [0, 1] against
-    the 98th percentile. The dominant band is the channel with the highest
-    ratio above its own median noise floor. The downbeat phase maximizes the
-    ratio of low-band energy on candidate downbeats versus off-beats; bars are
-    then indexed from that phase in 4/4 meter. Phrase energy is the 8-beat
-    symmetric moving average of strength, normalized to [0, 1].
+    Each band is sampled as the local maximum within ~60 ms of the beat
+    timestamp so slight beat-grid jitter never zeroes out beat energy.
+    Each band's full-envelope median noise floor is subtracted (clamped at 0)
+    so broadband hiss is removed without division-by-near-zero cliffs.
+    Strength is the summed band excess at the beat, scaled to [0, 1] against
+    the 98th percentile, and the dominant band is the channel with the
+    largest excess. Downbeat phase maximizes the mean on-beat vs off-beat
+    score combining low-band impact with total strength (falling back to
+    total strength when sub-bass energy is negligible). Bar indices are
+    non-negative, and phrase energy is the 8-beat moving average of strength
+    normalized to [0, 1].
     """
     import numpy as np
 
@@ -1501,43 +1506,64 @@ def _beat_details(
     band_names = ("low", "mid", "high")
     n_bins = low.size
     n = len(beats)
+    radius = max(1, round(0.06 / seconds_per_bin))
 
     def sample(band: np.ndarray, t: float) -> float:
-        return float(band[_beat_bin(t, seconds_per_bin, n_bins)])
+        center = _beat_bin(t, seconds_per_bin, n_bins)
+        lo = max(0, center - radius)
+        hi = min(n_bins, center + radius + 1)
+        return float(band[lo:hi].max())
 
-    floors = [float(np.median(b)) + 1e-9 for b in bands]
-    totals = np.array(
-        [sum(sample(b, t) for b in bands) for t in beats], dtype=np.float64
+    band_vals = np.array(
+        [[sample(b, t) for b in bands] for t in beats], dtype=np.float64
     )
+
+    band_medians = np.array([float(np.median(b)) for b in bands], dtype=np.float64)
+    excess = np.maximum(0.0, band_vals - band_medians)
+    active = excess if float(excess.max()) > 0.0 else band_vals
+
+    totals = active.sum(axis=1)
     scale = float(np.percentile(totals, 98)) or 1.0
     strengths = np.clip(totals / scale, 0.0, 1.0)
 
     band_idxs = [
-        int(np.argmax([sample(b, t) / floors[bi] for bi, b in enumerate(bands)]))
-        for t in beats
+        int(np.argmax(active[i]))
+        if float(active[i].max()) > 0.0
+        else int(np.argmax(band_vals[i]))
+        for i in range(n)
     ]
 
-    low_strengths = np.array([sample(low, t) for t in beats], dtype=np.float64)
+    low_vals = active[:, 0]
+    low_scale = float(np.percentile(low_vals, 98))
+    if low_scale > 0.0 and low_scale >= 0.05 * scale:
+        low_norm = np.clip(low_vals / low_scale, 0.0, 1.0)
+        downbeat_energy = 0.7 * low_norm + 0.3 * strengths
+    else:
+        downbeat_energy = strengths
+
     best_phase, best_score = 0, -1.0
-    for p in range(4):
-        mask = np.arange(n) % 4 == p
-        score = float(low_strengths[mask].sum()) / (
-            float(low_strengths[~mask].sum()) + 1e-9
-        )
+    indices = np.arange(n)
+    for p in range(min(4, n)):
+        mask = indices % 4 == p
+        if not mask.any():
+            continue
+        on_mean = float(downbeat_energy[mask].mean())
+        off_mean = float(downbeat_energy[~mask].mean()) if (~mask).any() else 0.0
+        score = on_mean / (off_mean + 1e-9)
         if score > best_score:
             best_score, best_phase = score, p
 
-    half = 4
     phrase = np.array(
-        [strengths[max(0, i - half) : min(n, i + half + 1)].mean() for i in range(n)],
+        [strengths[max(0, i - 4) : min(n, i + 4)].mean() for i in range(n)],
         dtype=np.float64,
     )
     phrase /= float(phrase.max()) or 1.0
 
+    bar_offset = 1 if best_phase > 0 else 0
     details = []
     for i, t in enumerate(beats):
         beat_in_bar = ((i - best_phase) % 4) + 1
-        bar_index = (i - best_phase) // 4
+        bar_index = (i - best_phase) // 4 + bar_offset
         details.append(
             BeatDetail(
                 t=round(float(t), 3),
@@ -1581,6 +1607,8 @@ def detect_beats(
                 onsets = tuple(float(o) for o in payload.get("onsets", []))
                 confidence = payload.get("confidence")
                 details_payload = payload.get("beat_details", [])
+                if not isinstance(details_payload, list):
+                    details_payload = []
                 beat_details = tuple(
                     BeatDetail(
                         t=float(d.get("t", 0.0)),
@@ -1592,6 +1620,7 @@ def detect_beats(
                         phrase_energy=float(d.get("phrase_energy", 0.0)),
                     )
                     for d in details_payload
+                    if isinstance(d, Mapping)
                 )
                 return BeatResult(
                     engine=str(payload.get("engine", "librosa")),
@@ -1607,7 +1636,7 @@ def detect_beats(
                     ),
                     beat_details=beat_details,
                 )
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 pass  # unparseable stdout: fall through to the baseline
     pcm = _decode_mono_pcm(path, scratch_dir=scratch_dir, cancel=cancel)
     duration = float(pcm.size / _BEAT_SAMPLE_RATE)
