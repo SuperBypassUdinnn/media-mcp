@@ -2679,6 +2679,8 @@ def _motion_work(
     )
     diffs = [point.diff for point in points]
     distances = [point.hist_dist for point in points]
+    color_diffs = [p.chroma_diff for p in points]
+    p95_diffs = [p.p95_chroma for p in points]
     _write_json(
         entry / "motion.json",
         {
@@ -2688,20 +2690,30 @@ def _motion_work(
                 "span_s": round(points[-1].t, 3) if points else 0.0,
                 "peak_diff": round(max(diffs), 4) if diffs else 0.0,
                 "mean_diff": round(sum(diffs) / len(diffs), 4) if diffs else 0.0,
+                "color_peak": round(max(color_diffs), 4) if color_diffs else 0.0,
+                "color_mean": (
+                    round(sum(color_diffs) / len(color_diffs), 4)
+                    if color_diffs
+                    else 0.0
+                ),
                 "max_hist_dist": round(max(distances), 4) if distances else 0.0,
                 "quiet_share": (
                     round(sum(1 for d in diffs if d <= 1.0) / len(diffs), 3)
                     if diffs
                     else 1.0
                 ),
+                "p95_chroma_peak": round(max(p95_diffs), 4) if p95_diffs else 0.0,
             },
             "events": [asdict(event) for event in events],
         },
     )
     tsv_path = entry / "motion-curve.tsv"
     tsv_path.write_text(
-        "t\tdiff\thist_dist\n"
-        + "".join(f"{p.t:.3f}\t{p.diff}\t{p.hist_dist}\n" for p in points),
+        "t\tdiff\thist_dist\tchroma_diff\tp95_chroma\n"
+        + "".join(
+            f"{p.t:.3f}\t{p.diff}\t{p.hist_dist}\t{p.chroma_diff}\t{p.p95_chroma}\n"
+            for p in points
+        ),
         encoding="utf-8",
     )
     _record_entry(entry, resolved)
@@ -3121,8 +3133,12 @@ _TOOL_DESCRIPTIONS = {
         "energy and histogram correlation, summarized as burst (animation "
         "spans), hold (static points), transition (gradual blends the "
         "hard-cut detector cannot see), and keyframe (rest points inside "
-        "bursts) events. `source` is an absolute local path or an http/https "
-        "media URL. Writes motion.json plus a motion-curve.tsv sidecar in "
+        "bursts) events; color_sweep events mark spans where chromatic delta "
+        "rises while luma motion stays flat. Each curve point also carries "
+        "`chroma_diff` and `p95_chroma`, and motion.json's summary reports "
+        "`color_peak`, `color_mean`, and `p95_chroma_peak`. `source` is an "
+        "absolute local path or an http/https media URL. Writes motion.json "
+        "plus a motion-curve.tsv sidecar in "
         "the source's cache entry and names both in the response. Sources "
         "beyond the frame cap analyze their first span only. Use it to find "
         "where a motion-graphics video actually animates, then pull frames "

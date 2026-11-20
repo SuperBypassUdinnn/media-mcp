@@ -510,8 +510,11 @@ def test_media_motion_tool(tmp_path, monkeypatch):
     assert summary["span_s"] > 0
     assert summary["peak_diff"] >= summary["mean_diff"] >= 0.0
     assert 0.0 <= summary["quiet_share"] <= 1.0
+    assert summary["color_peak"] >= 0.0
+    assert 0.0 <= summary["color_mean"]
+    assert summary["p95_chroma_peak"] >= 0.0
     curve_tsv = next(cache.rglob("motion-curve.tsv"))
     header, *rows = curve_tsv.read_text().splitlines()
-    assert header == "t\tdiff\thist_dist"
+    assert header == "t\tdiff\thist_dist\tchroma_diff\tp95_chroma"
     assert len(rows) == payload["points"]
     assert "Artifacts:" in result and "motion-curve.tsv" in result
