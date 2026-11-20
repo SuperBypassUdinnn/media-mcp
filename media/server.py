@@ -2751,6 +2751,22 @@ def _motion_work(
 _RHYTHM_WRAPPER = Path(__file__).resolve().parent.parent / "rhythm" / "rhythm.sh"
 
 
+def _band_character(details: tuple[media.BeatDetail, ...]) -> str:
+    """Band breakdown with a downbeat marker, e.g. ``8 low (downbeat), 12 mid, 16 high``."""
+    counts: dict[str, int] = {}
+    downbeat_bands: set[str] = set()
+    for d in details:
+        counts[d.band] = counts.get(d.band, 0) + 1
+        if d.is_downbeat:
+            downbeat_bands.add(d.band)
+    parts = [
+        f"{counts[band]} {band}" + (" (downbeat)" if band in downbeat_bands else "")
+        for band in ("low", "mid", "high")
+        if band in counts
+    ]
+    return ", ".join(parts)
+
+
 async def media_beats(source: str, identity: str = "sampled") -> str:
     """Analyze a source's rhythm: onsets, tempo, and a beat grid.
 
@@ -2790,6 +2806,18 @@ def _beats_work(
             "beats": list(result.beats),
             "onsets": list(result.onsets),
             "confidence": result.confidence,
+            "beat_details": [
+                {
+                    "t": d.t,
+                    "strength": d.strength,
+                    "band": d.band,
+                    "is_downbeat": d.is_downbeat,
+                    "bar_index": d.bar_index,
+                    "beat_in_bar": d.beat_in_bar,
+                    "phrase_energy": d.phrase_energy,
+                }
+                for d in result.beat_details
+            ],
             "source": resolved.source,
         },
     )
@@ -2827,6 +2855,16 @@ def _beats_work(
             "within 70 ms)"
             if result.confidence is not None
             else "Confidence: not measurable (no beats or no onsets)"
+        ),
+        (
+            f"Downbeats: {sum(1 for d in result.beat_details if d.is_downbeat)}"
+            if result.beat_details
+            else "Downbeats: 0"
+        ),
+        (
+            f"Character: {_band_character(result.beat_details)}"
+            if result.beat_details
+            else "Character: no beats"
         ),
         "",
         f"Artifact: {entry / 'beats.json'}",
@@ -3097,8 +3135,10 @@ _TOOL_DESCRIPTIONS = {
         "flux baseline marked `degraded` when that venv is missing — build "
         "it once with rhythm/setup.sh. Writes beats.json in the source's "
         "cache entry and names it in the response; media_frames(at='beats') "
-        "consumes the same file. Use it for AMV-style work: find the beat "
-        "grid, then pull frames on it."
+        "consumes the same file. beats.json also carries `beat_details`: per-"
+        "beat `t`, `strength`, spectral `band` (low/mid/high), `is_downbeat`, "
+        "`bar_index`, `beat_in_bar`, and `phrase_energy`. Use it for AMV-style "
+        "work: find the beat grid, then pull frames on it."
     ),
     "media_avsync": (
         "Correlate a media source's visual cuts with its audio onsets - "

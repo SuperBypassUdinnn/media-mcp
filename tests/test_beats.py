@@ -331,6 +331,20 @@ def test_media_beats_tool(tmp_path, monkeypatch):
     assert "confidence" in payload
     if payload["beats"]:
         assert payload["confidence"] is None or payload["confidence"] >= 0.5
+    # Spec section 5: beats.json carries per-beat band/downbeat details.
+    details = payload["beat_details"]
+    assert isinstance(details, list)
+    expected_keys = {
+        "t",
+        "strength",
+        "band",
+        "is_downbeat",
+        "bar_index",
+        "beat_in_bar",
+        "phrase_energy",
+    }
+    for item in details:
+        assert set(item) == expected_keys, (item, expected_keys)
 
 
 def test_media_frames_at_beats(tmp_path, monkeypatch):
