@@ -18,6 +18,7 @@ import math
 import wave
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -132,7 +133,7 @@ def test_music_engine_tonal_bed_key_detection(tmp_path):
     assert payload["key"] == "C major" or (
         payload["mode"] == "major" and payload["key"] and payload["key"].startswith("C")
     ), payload
-    assert payload["key_confidence"] >= 0.3, payload
+    assert 0.3 <= payload["key_confidence"] <= 1.0, payload
     assert payload["harmonic_ratio"] >= 0.55, payload
 
 
@@ -154,6 +155,24 @@ def test_music_engine_silence_payload_valid(tmp_path):
     assert payload["harmonic_ratio"] == 0.0, payload
     assert payload["mood_tags"] == [], payload
     assert _no_na(payload), payload
+
+
+def _write_white_noise(path: Path, seconds: float = 2.0) -> Path:
+    """2 s of band-limited white noise (no tonal content)."""
+    rng = np.random.default_rng(0)
+    total = int(RATE * seconds)
+    samples = [float(s) for s in rng.standard_normal(total)]
+    return _write_wav(path, samples)
+
+
+@pytest.mark.skipif(not venv.exists(), reason="rhythm/.venv not built")
+def test_music_engine_noise_key_confidence_low(tmp_path):
+    path = _write_white_noise(tmp_path / "noise.wav")
+    payload = _run_music_sh(wrapper, path)
+    assert payload["engine"] == "librosa"
+    assert payload["degraded"] is False
+    # White noise has no tonal center: either no key, or a low confidence.
+    assert payload["key"] is None or payload["key_confidence"] < 0.5, payload
 
 
 @pytest.mark.skipif(not venv.exists(), reason="rhythm/.venv not built")
