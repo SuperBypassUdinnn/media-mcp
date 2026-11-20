@@ -382,9 +382,7 @@ def test_motion_events_hold_suppressed_by_color_sweep():
     assert len(sweeps) == 1, events
     assert sweeps[0].start == 1.0 and abs(sweeps[0].end - 2.0) < 0.15
     holds = [e for e in events if e.kind == "hold"]
-    assert [(round(h.start, 3), round(h.end, 3)) for h in holds] == [
-        (2.3, 3.3)
-    ], holds
+    assert [(round(h.start, 3), round(h.end, 3)) for h in holds] == [(2.3, 3.3)], holds
 
 
 def test_motion_events_empty_curve():
