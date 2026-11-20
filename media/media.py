@@ -1221,16 +1221,21 @@ def motion_events(
     the 5-second rolling median, with an absolute floor of 1.0 level so a
     nearly static clip's tiny baseline cannot flag its own encoding noise;
     runs shorter than `burst_min_s` are dropped. A **hold** is a run at or
-    below `hold_max_diff` lasting at least `hold_min_s`. A **transition**
-    is a run where the histogram earth mover's distance stays at or above
-    `transition_min_dist` for at least `transition_min_s` — sustained
-    histogram travel separates a gradual blend from a one-frame hard cut,
-    which `scdet` already reports. Runs of every kind bridge gaps of up to
-    `bridge_frames` False values, because frame-rate conversion duplicates
-    and codec noise punch single-frame holes into steady signals. A
-    **keyframe** is a local difference minimum strictly inside a burst
-    (both neighbors higher): the animation's rest point worth rasterizing.
-    Events return sorted by `(start, kind)`; an empty curve returns `[]`.
+    below `hold_max_diff` lasting at least `hold_min_s`; any hold whose span
+    overlaps an active `color_sweep` span by more than 0.1 seconds is
+    suppressed, since saturated color motion is not a static hold. A
+    **transition** is a run where the histogram earth mover's distance stays
+    at or above `transition_min_dist` for at least `transition_min_s` —
+    sustained histogram travel separates a gradual blend from a one-frame hard
+    cut, which `scdet` already reports. A **color_sweep** is a run where the
+    95th-percentile chroma delta reaches 8.0 levels or the mean chroma delta
+    reaches 1.5 levels, lasting at least 0.3 seconds. Runs of every kind
+    bridge gaps of up to `bridge_frames` False values, because frame-rate
+    conversion duplicates and codec noise punch single-frame holes into steady
+    signals. A **keyframe** is a local difference minimum strictly inside a
+    burst (both neighbors higher): the animation's rest point worth
+    rasterizing. Events return sorted by `(start, kind)`; an empty curve
+    returns `[]`.
     """
     import numpy as np
 
@@ -1238,6 +1243,8 @@ def motion_events(
         return []
     diffs = np.array([p.diff for p in points], dtype=np.float64)
     dists = np.array([p.hist_dist for p in points], dtype=np.float64)
+    chroma_diffs = np.array([p.chroma_diff for p in points], dtype=np.float64)
+    p95_chromas = np.array([p.p95_chroma for p in points], dtype=np.float64)
     times = np.array([p.t for p in points], dtype=np.float64)
     step = 1.0 / analysis_fps
     events: list[MotionEvent] = []
@@ -1256,7 +1263,22 @@ def motion_events(
             f"baseline {baseline[first : last + 1].mean():.2f}"
         ),
     )
-    events += _motion_runs(
+    sweep_mask = (p95_chromas >= 8.0) | (chroma_diffs >= 1.5)
+    sweep_events = _motion_runs(
+        "color_sweep",
+        sweep_mask,
+        times,
+        step,
+        0.3,
+        bridge_frames,
+        lambda first, last: (
+            f"peak p95 chroma {p95_chromas[first : last + 1].max():.2f}, "
+            f"peak chroma diff {chroma_diffs[first : last + 1].max():.2f} levels"
+        ),
+    )
+    events += sweep_events
+    sweep_spans = [(event.start, event.end) for event in sweep_events]
+    hold_events = _motion_runs(
         "hold",
         diffs <= hold_max_diff,
         times,
@@ -1265,6 +1287,14 @@ def motion_events(
         bridge_frames,
         lambda first, last: f"max diff {diffs[first : last + 1].max():.2f} levels",
     )
+    for hold in hold_events:
+        overlaps_sweep = any(
+            min(hold.end, sweep_end) - max(hold.start, sweep_start) > 0.1
+            for sweep_start, sweep_end in sweep_spans
+        )
+        if overlaps_sweep:
+            continue
+        events.append(hold)
     events += _motion_runs(
         "transition",
         (dists >= transition_min_dist) & (diffs >= _MOTION_TRANSITION_MIN_DIFF),

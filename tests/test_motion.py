@@ -253,21 +253,35 @@ def _write_xfade_video(path: Path) -> Path:
 
 
 def _points(
-    diffs: list[float], dists: list[float] | None = None, fps: float = 10.0
+    diffs: list[float],
+    dists: list[float] | None = None,
+    chroma_diffs: list[float] | None = None,
+    p95_chromas: list[float] | None = None,
+    hue_shifts: list[float] | None = None,
+    fps: float = 10.0,
 ) -> list[media_mod.MotionCurvePoint]:
     """Build a curve from per-index values, defaulting distances to 0.0."""
+    n = len(diffs)
     if dists is None:
-        dists = [0.0] * len(diffs)
+        dists = [0.0] * n
+    if chroma_diffs is None:
+        chroma_diffs = [0.0] * n
+    if p95_chromas is None:
+        p95_chromas = [0.0] * n
+    if hue_shifts is None:
+        hue_shifts = [0.0] * n
     return [
         media_mod.MotionCurvePoint(
             t=i / fps,
             diff=d,
             hist_dist=c,
-            chroma_diff=0.0,
-            p95_chroma=0.0,
-            hue_shift=0.0,
+            chroma_diff=cd,
+            p95_chroma=p,
+            hue_shift=h,
         )
-        for i, (d, c) in enumerate(zip(diffs, dists, strict=True))
+        for i, (d, c, cd, p, h) in enumerate(
+            zip(diffs, dists, chroma_diffs, p95_chromas, hue_shifts, strict=True)
+        )
     ]
 
 
@@ -335,6 +349,42 @@ def test_motion_events_keyframes_inside_burst():
     assert len(keyframes) == 1, keyframes
     assert keyframes[0].start == keyframes[0].end == 1.5
     assert "inside burst" in keyframes[0].detail
+
+
+def test_motion_events_color_sweep_detected():
+    # 1 s flat, 1 s color sweep (luma diff 0.2 below the hold floor,
+    # p95_chroma 25), 1 s flat at 10 fps.
+    curve = _points(
+        [0.0] * 10 + [0.2] * 10 + [0.0] * 10,
+        p95_chromas=[0.0] * 10 + [25.0] * 10 + [0.0] * 10,
+        fps=10.0,
+    )
+    events = media_mod.motion_events(curve, analysis_fps=10.0)
+    sweeps = [e for e in events if e.kind == "color_sweep"]
+    assert len(sweeps) == 1, events
+    assert sweeps[0].start == 1.0
+    assert abs(sweeps[0].end - 2.0) < 0.15
+    assert "25.00" in sweeps[0].detail, sweeps[0].detail
+
+
+def test_motion_events_hold_suppressed_by_color_sweep():
+    # Hold at 0-2 s, color sweep at 1-2 s (luma diff 0.2, p95_chroma 25),
+    # burst at 2-2.3 s, hold at 2.3-3.3 s at 10 fps. The 0-2 s hold overlaps
+    # the sweep by 1.0 s (> 0.1 s) and is suppressed; the 2.3-3.3 s hold does
+    # not overlap the sweep and survives.
+    curve = _points(
+        [0.0] * 10 + [0.2] * 10 + [80.0] * 3 + [0.0] * 10,
+        p95_chromas=[0.0] * 10 + [25.0] * 10 + [0.0] * 13,
+        fps=10.0,
+    )
+    events = media_mod.motion_events(curve, analysis_fps=10.0)
+    sweeps = [e for e in events if e.kind == "color_sweep"]
+    assert len(sweeps) == 1, events
+    assert sweeps[0].start == 1.0 and abs(sweeps[0].end - 2.0) < 0.15
+    holds = [e for e in events if e.kind == "hold"]
+    assert [(round(h.start, 3), round(h.end, 3)) for h in holds] == [
+        (2.3, 3.3)
+    ], holds
 
 
 def test_motion_events_empty_curve():
