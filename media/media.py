@@ -848,21 +848,28 @@ class MotionCurvePoint:
     """One analysis frame's motion signals.
 
     `t` is the frame's media-time second (`index / analysis_fps`), `diff` is
-    the mean absolute grayscale difference against the previous analysis
-    frame in 0..255 levels (0.0 for the first frame, which has no
-    predecessor), and `hist_dist` is the one-dimensional earth mover's
-    distance between the two frames' 64-bin grayscale histograms — the mean
-    absolute shift of the cumulative distribution, 0..1 (0.0 for the first
-    frame). Earth mover's distance is used because flat-color content puts
-    all histogram mass in one bin: a gradual fade then shifts the whole
-    mass a few bins per frame, which a support-overlap measure reports as
-    total displacement 1.0 while EMD reports the honest small shift, and
-    motion graphics are full of exactly such flat-color scenes.
+    the mean absolute luma difference against the previous analysis frame in
+    0..255 levels (0.0 for the first frame, which has no predecessor), and
+    `hist_dist` is the one-dimensional earth mover's distance between the two
+    frames' 64-bin luma histograms — the mean absolute shift of the cumulative
+    distribution, 0..1 (0.0 for the first frame). Earth mover's distance is
+    used because flat-color content puts all histogram mass in one bin: a
+    gradual fade then shifts the whole mass a few bins per frame, which a
+    support-overlap measure reports as total displacement 1.0 while EMD
+    reports the honest small shift, and motion graphics are full of exactly
+    such flat-color scenes. `chroma_diff` is the mean per-pixel Euclidean
+    chroma distance `sqrt(dU^2 + dV^2)` in Rec.601 UV space, `p95_chroma` is
+    its 95th percentile, and `hue_shift` is the mean circular hue difference
+    (degrees, 0..180) over saturated pixels (HSV S > 30), 0.0 when there are
+    none.
     """
 
     t: float
     diff: float
     hist_dist: float
+    chroma_diff: float
+    p95_chroma: float
+    hue_shift: float
 
 
 @dataclass(frozen=True)
@@ -902,14 +909,14 @@ def _motion_frame_geometry(
     frame_bytes = 0
     scaled_height = 0
     for candidate in sorted({_even(base - 2), _even(base), _even(base + 2)}):
-        if candidate > 0 and raster_bytes % (width * candidate) == 0:
+        if candidate > 0 and raster_bytes % (width * candidate * 3) == 0:
             scaled_height = candidate
-            frame_bytes = width * candidate
+            frame_bytes = width * candidate * 3
             break
     if not frame_bytes:
         raise MediaError(
             f"motion raster of {raster_bytes} bytes does not divide into "
-            f"{width}-wide gray frames around expected height {base}; a "
+            f"{width}-wide rgb24 frames around expected height {base}; a "
             "changed ffmpeg scale rule would make frame indexing lie"
         )
     return scaled_height, raster_bytes // frame_bytes
@@ -930,13 +937,15 @@ def motion_curve(
 ) -> list[MotionCurvePoint]:
     """Decode `path` decimated and return its per-frame motion signals.
 
-    One ffmpeg pass runs `fps=<analysis_fps>,scale=<width>:-2,format=gray`
-    over the whole source and writes the raw one-byte-per-pixel raster to
-    `<scratch_dir>/motion-raster.gray` (or a fresh temp directory when
-    `scratch_dir` is `None`); the file is deleted before returning, success
-    or failure. Frames are then read one at a time — memory stays at two
-    frames no matter how long the source is — and each frame yields a
-    `MotionCurvePoint` against its predecessor. The raster is capped at
+    One ffmpeg pass runs `fps=<analysis_fps>,scale=<width>:-2,format=rgb24`
+    over the whole source and writes the raw three-bytes-per-pixel RGB24
+    raster to `<scratch_dir>/motion-raster.rgb24` (or a fresh temp directory
+    when `scratch_dir` is `None`); the file is deleted before returning,
+    success or failure. Frames are then read one at a time — memory stays at
+    two frames no matter how long the source is — and each frame yields a
+    `MotionCurvePoint` against its predecessor. `diff` and `hist_dist` are
+    computed on the Rec.601 luma channel; `chroma_diff`, `p95_chroma`, and
+    `hue_shift` are computed from the RGB channels. The raster is capped at
     `_MOTION_MAX_FRAMES` frames; longer sources analyze their first hour and
     the caller reports the cap. A source with no video stream, non-positive
     parameters, a failed ffmpeg run, or a raster that does not divide into
@@ -955,7 +964,7 @@ def motion_curve(
         raise MediaError(f"motion analysis needs a video stream; {path} has none")
     scratch = Path(scratch_dir) if scratch_dir is not None else Path(tempfile.mkdtemp())
     scratch.mkdir(parents=True, exist_ok=True)
-    raster_path = scratch / "motion-raster.gray"
+    raster_path = scratch / "motion-raster.rgb24"
     argv = [
         "ffmpeg",
         "-hide_banner",
@@ -968,7 +977,7 @@ def motion_curve(
         "-vf",
         (
             f"fps={_plain_decimal(analysis_fps)},"
-            f"scale={_plain_decimal(width)}:-2,format=gray"
+            f"scale={_plain_decimal(width)}:-2,format=rgb24"
         ),
         "-frames:v",
         str(_MOTION_MAX_FRAMES),
@@ -986,31 +995,123 @@ def motion_curve(
         scaled_height, frame_count = _motion_frame_geometry(
             raster_path.stat().st_size, width, result.width, result.height
         )
-        frame_bytes = width * scaled_height
+        frame_bytes = width * scaled_height * 3
         points: list[MotionCurvePoint] = []
-        prev: np.ndarray | None = None
+        prev_rgb: np.ndarray | None = None
+        prev_y: np.ndarray | None = None
         with raster_path.open("rb") as raster:
             for index in range(frame_count):
                 buffer = raster.read(frame_bytes)
                 if len(buffer) < frame_bytes:
                     break  # truncated tail: analyze what decoded cleanly
-                current = np.frombuffer(buffer, np.uint8).reshape(scaled_height, width)
-                if prev is None:
-                    diff, dist = 0.0, 0.0
+                current_rgb = np.frombuffer(buffer, np.uint8).reshape(
+                    scaled_height, width, 3
+                )
+                if prev_rgb is None:
+                    diff, dist, chroma_d, p95, hue = 0.0, 0.0, 0.0, 0.0, 0.0
                 else:
+                    cur_y = _motion_luma(current_rgb)
+                    prev_y = _motion_luma(prev_rgb)
                     diff = float(
-                        np.abs(current.astype(np.int16) - prev.astype(np.int16)).mean()
+                        np.abs(cur_y.astype(np.int16) - prev_y.astype(np.int16)).mean()
                     )
-                    dist = _motion_hist_dist(current, prev)
+                    dist = _motion_hist_dist(
+                        cur_y.astype(np.uint8), prev_y.astype(np.uint8)
+                    )
+                    chroma_d, p95 = _motion_chroma_delta(current_rgb, prev_rgb)
+                    hue = _motion_hue_shift(current_rgb, prev_rgb)
                 points.append(
                     MotionCurvePoint(
-                        t=index / analysis_fps, diff=round(diff, 4), hist_dist=dist
+                        t=index / analysis_fps,
+                        diff=round(diff, 4),
+                        hist_dist=round(dist, 4),
+                        chroma_diff=round(chroma_d, 4),
+                        p95_chroma=round(p95, 4),
+                        hue_shift=round(hue, 4),
                     )
                 )
-                prev = current
+                prev_rgb = current_rgb
         return points
     finally:
         raster_path.unlink(missing_ok=True)
+
+
+def _motion_luma(rgb: np.ndarray) -> np.ndarray:
+    """Rec.601 luma Y = 0.299R + 0.587G + 0.114B from an RGB24 frame."""
+    import numpy as np
+
+    r = rgb[..., 0].astype(np.float64)
+    g = rgb[..., 1].astype(np.float64)
+    b = rgb[..., 2].astype(np.float64)
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def _motion_uv(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Rec.601 chroma U, V for an RGB24 frame."""
+    import numpy as np
+
+    r = rgb[..., 0].astype(np.float64)
+    g = rgb[..., 1].astype(np.float64)
+    b = rgb[..., 2].astype(np.float64)
+    u = -0.147 * r - 0.289 * g + 0.436 * b
+    v = 0.615 * r - 0.515 * g - 0.100 * b
+    return u, v
+
+
+def _motion_chroma_delta(cur: np.ndarray, prev: np.ndarray) -> tuple[float, float]:
+    """Mean and 95th-percentile per-pixel Euclidean chroma distance."""
+    import numpy as np
+
+    cu, cv_ = _motion_uv(cur)
+    pu, pv = _motion_uv(prev)
+    delta = np.sqrt((cu - pu) ** 2 + (cv_ - pv) ** 2)
+    return float(delta.mean()), float(np.percentile(delta, 95))
+
+
+def _motion_hue_shift(cur: np.ndarray, prev: np.ndarray) -> float:
+    """Mean circular hue difference (degrees, 0..180) over saturated pixels.
+
+    Saturated means HSV S > 30 on the 0..255 scale. Pixels below the
+    threshold in both frames are excluded; when none qualify the shift is
+    0.0.
+    """
+    import numpy as np
+
+    h1, s1, _ = _motion_hsv(cur)
+    h2, s2, _ = _motion_hsv(prev)
+    sat = np.maximum(s1, s2) > 30.0
+    if not bool(sat.any()):
+        return 0.0
+    d = np.abs(h1 - h2)
+    d = np.minimum(d, 360.0 - d)  # circular difference in [0, 180]
+    return float(d[sat].mean())
+
+
+def _motion_hsv(
+    rgb: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """HSV (H in degrees 0..360, S and V in 0..255) for an RGB24 frame."""
+    import numpy as np
+
+    r = rgb[..., 0].astype(np.float64) / 255.0
+    g = rgb[..., 1].astype(np.float64) / 255.0
+    b = rgb[..., 2].astype(np.float64) / 255.0
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    df = mx - mn
+    h = np.zeros_like(mx)
+    mask = df > 1e-6
+    red = mask & (mx == r)
+    green = mask & (mx == g)
+    blue = mask & (mx == b)
+    h[red] = (60.0 * ((g[red] - b[red]) / df[red])) % 360.0
+    h[green] = (60.0 * ((b[green] - r[green]) / df[green]) + 120.0) % 360.0
+    h[blue] = (60.0 * ((r[blue] - g[blue]) / df[blue]) + 240.0) % 360.0
+    s = np.zeros_like(mx)
+    np.divide(df, mx, out=s, where=mx > 0.0)
+    s = s * 255.0
+    v = mx * 255.0
+    return h, s, v
 
 
 def _motion_hist_dist(current: np.ndarray, previous: np.ndarray) -> float:

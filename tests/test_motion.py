@@ -58,6 +58,112 @@ def _write_static_video(path: Path, seconds: float = 3.0) -> Path:
     return path
 
 
+def _write_lossless_color_video(path: Path, color: str, seconds: float = 1.0) -> Path:
+    """A lossless RGB24 solid-color clip (exact pixel preservation)."""
+    _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={color}:size={SIZE}:rate={RATE}:duration={seconds}",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "rgb24",
+            str(path),
+        ]
+    )
+    return path
+
+
+def _write_color_pair_video(
+    path: Path, color_a: str, color_b: str, seconds: float = 1.0
+) -> Path:
+    """Solid color A for `seconds` then solid color B, lossless RGB24."""
+    _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={color_a}:size={SIZE}:rate={RATE}:duration={seconds}",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={color_b}:size={SIZE}:rate={RATE}:duration={seconds}",
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+            "-map",
+            "[v]",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "rgb24",
+            str(path),
+        ]
+    )
+    return path
+
+
+def _write_patch_pair_video(
+    path: Path, patch_color_a: str, patch_color_b: str, seconds: float = 1.0
+) -> Path:
+    """Dark background with a small color patch that is A then B, lossless RGB24.
+
+    The patch covers roughly 8% of the frame so a moderate local chroma change
+    lifts p95_chroma while the global mean chroma_diff stays under the floor.
+    """
+    _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=0x141414:size={SIZE}:rate={RATE}:duration={seconds * 2}",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={patch_color_a}:size=80x80:rate={RATE}:duration={seconds}",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={patch_color_b}:size=80x80:rate={RATE}:duration={seconds}",
+            "-filter_complex",
+            (
+                "[0:v]format=rgb24[bg];"
+                "[1:v]format=rgb24[pa];"
+                "[2:v]format=rgb24[pb];"
+                "[bg][pa]overlay=x=0:y=0:enable='lte(t,1)'[v1];"
+                "[v1][pb]overlay=x=0:y=0:enable='gt(t,1)'[v]"
+            ),
+            "-map",
+            "[v]",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "rgb24",
+            str(path),
+        ]
+    )
+    return path
+
+
 def _write_motion_burst_video(path: Path) -> Path:
     """Static 1 s, then a white patch slides right for 2 s, then static 1 s.
 
@@ -153,7 +259,14 @@ def _points(
     if dists is None:
         dists = [0.0] * len(diffs)
     return [
-        media_mod.MotionCurvePoint(t=i / fps, diff=d, hist_dist=c)
+        media_mod.MotionCurvePoint(
+            t=i / fps,
+            diff=d,
+            hist_dist=c,
+            chroma_diff=0.0,
+            p95_chroma=0.0,
+            hue_shift=0.0,
+        )
         for i, (d, c) in enumerate(zip(diffs, dists, strict=True))
     ]
 
@@ -260,6 +373,40 @@ def test_motion_curve_xfade_video_has_transition(tmp_path):
     assert transitions, events
     # The blend runs 1.5-2.5 s; the detected transition must overlap it.
     assert transitions[0].start < 2.5 and transitions[0].end > 1.5
+
+
+def test_motion_curve_chromatic_delta(tmp_path):
+    # Gray (luma ~128, zero chroma) then a saturated orange (same luma ~128,
+    # high chroma): luma diff stays near zero while chroma delta is large.
+    path = _write_color_pair_video(tmp_path / "chroma.mp4", "0x808080", "0xFF5800")
+    points = media_mod.motion_curve(path, scratch_dir=tmp_path, analysis_fps=10.0)
+    assert len(points) >= 15, points
+    cut = points[10]  # first frame of the second color (t = 1.0 s)
+    assert cut.diff < 2.0, cut
+    assert cut.chroma_diff > 20.0, cut
+
+
+def test_motion_curve_p95_chroma_local_sweep(tmp_path):
+    # Dark frame with a small color patch that changes hue mid-clip: a strong
+    # local chroma delta on a minority of pixels lifts p95_chroma while the
+    # global mean chroma_diff stays under the floor.
+    path = _write_patch_pair_video(tmp_path / "patch.mp4", "0x3C3C3C", "0x462C2C")
+    points = media_mod.motion_curve(path, scratch_dir=tmp_path, analysis_fps=10.0)
+    assert len(points) >= 15, points
+    cut = max(points, key=lambda p: p.p95_chroma)  # frame where the patch flips
+    assert cut.chroma_diff < 2.0, cut
+    assert cut.p95_chroma > 15.0, cut
+
+
+def test_motion_curve_monochromatic_zero(tmp_path):
+    # Purely gray content: no chroma anywhere, so all chromatic signals are 0.
+    path = _write_lossless_color_video(tmp_path / "mono.mp4", "0x808080")
+    points = media_mod.motion_curve(path, scratch_dir=tmp_path, analysis_fps=10.0)
+    assert points, points
+    for point in points:
+        assert point.chroma_diff == 0.0, point
+        assert point.p95_chroma == 0.0, point
+        assert point.hue_shift == 0.0, point
 
 
 def test_motion_curve_rejects_params_and_audio_only(tmp_path):
