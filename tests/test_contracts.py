@@ -130,6 +130,7 @@ def test_build_argv_emits_only_flags_the_pipeline_accepts(tmp_path):
         "--no-diarize",
         "--language",
         "--device",
+        "--condition-on-previous-text",
     }
     assert body == [
         "--model",
@@ -140,12 +141,13 @@ def test_build_argv_emits_only_flags_the_pipeline_accepts(tmp_path):
         "en",
         "--device",
         "cuda",
+        "--condition-on-previous-text",
     ]
 
 
 def test_build_argv_skips_auto_model_and_uses_no_diarize_at_zero(tmp_path):
     argv = contracts.build_argv("in.mp4", tmp_path, "auto", 0, "", "", False, 60)
-    assert argv[2:-2] == ["--no-diarize"]
+    assert argv[2:-2] == ["--no-diarize", "--condition-on-previous-text"]
 
 
 # Running the delegated pipeline --------------------------------------------------

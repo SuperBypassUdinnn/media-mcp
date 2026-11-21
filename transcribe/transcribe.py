@@ -82,6 +82,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="auto",
         help="CTranslate2 compute type (default: auto -> int8/float32).",
     )
+    parser.add_argument(
+        "--condition-on-previous-text",
+        action="store_true",
+        default=True,
+        help="Condition the Whisper decode on previous text (default: on). "
+        "Pass --no-condition-on-previous-text to disable it (hallucination "
+        "guard on instrumental stems).",
+    )
+    parser.add_argument(
+        "--no-condition-on-previous-text",
+        action="store_false",
+        dest="condition_on_previous_text",
+        help="Disable conditioning on previous text.",
+    )
     return parser.parse_args(argv)
 
 
@@ -183,7 +197,8 @@ def transcribe_with_fallback(
     device: str,
     compute: str,
     use_vad: bool = True,
-) -> list[dict]:
+    condition_on_previous_text: bool = True,
+) -> tuple[list[dict], str | None]:
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
@@ -204,13 +219,15 @@ def transcribe_with_fallback(
                 whisper = WhisperModel(tier, device=dev, compute_type=ctype)
                 lang = None if language == "auto" else language
                 vad_params = {"min_silence_duration_ms": 500} if use_vad else None
-                segments, _ = whisper.transcribe(
+                segments, info = whisper.transcribe(
                     str(wav),
                     language=lang,
                     vad_filter=use_vad,
                     vad_parameters=vad_params,
                     word_timestamps=True,
+                    condition_on_previous_text=condition_on_previous_text,
                 )
+                detected_language = getattr(info, "language", None)
                 return [
                     {
                         "start": float(s.start),
@@ -225,9 +242,19 @@ def transcribe_with_fallback(
                             for w in (s.words or [])
                             if w.word.strip()
                         ],
+                        "no_speech_prob": (
+                            float(s.no_speech_prob)
+                            if getattr(s, "no_speech_prob", None) is not None
+                            else None
+                        ),
+                        "avg_logprob": (
+                            float(s.avg_logprob)
+                            if getattr(s, "avg_logprob", None) is not None
+                            else None
+                        ),
                     }
                     for s in segments
-                ]
+                ], detected_language
             except Exception as exc:
                 message = str(exc).lower()
                 if "memory" in message or "cuda" in message or "cublas" in message:
@@ -420,13 +447,14 @@ def main(argv: list[str] | None = None) -> int:
         device = resolve_device(args.device)
         # CLI boundary: any transcription failure across fallback tiers is fatal.
         try:
-            segments = transcribe_with_fallback(
+            segments, detected_language = transcribe_with_fallback(
                 wav,
                 args.model,
                 args.language,
                 device,
                 args.compute,
                 use_vad=not args.no_vad,
+                condition_on_previous_text=args.condition_on_previous_text,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -456,7 +484,12 @@ def main(argv: list[str] | None = None) -> int:
                     "without speaker labels.",
                     file=sys.stderr,
                 )
-        meta = {"source": args.input, "model": args.model, "title": stem}
+        meta = {
+            "source": args.input,
+            "model": args.model,
+            "title": stem,
+            "language": detected_language,
+        }
         write_srt(segments, out_dir / f"{stem}.srt", show_labels)
         write_vtt(segments, out_dir / f"{stem}.vtt", show_labels)
         write_json(segments, out_dir / f"{stem}.json", meta, show_labels)

@@ -2991,7 +2991,9 @@ def _music_work(
     if with_vocals:
         separate_bin = os.environ.get("MEDIA_SEPARATE_BIN")
 
-        def _transcribe_backend(stem_path: Path) -> list[dict[str, object]]:
+        def _transcribe_backend(
+            stem_path: Path,
+        ) -> tuple[list[dict[str, object]], str | None]:
             """Transcribe the vocals stem through the existing transcribe backend."""
             out_dir = entry / "transcribe-stem"
             _empty_dir(out_dir)
@@ -3004,11 +3006,16 @@ def _music_work(
                 "cpu",
                 False,
                 settings.call_timeout_seconds,
+                condition_on_previous_text=False,
             )
             transcript_result = contracts.run_transcript(
                 argv, settings.call_timeout_seconds, cancel
             )
-            return transcript_result.segments
+            meta = transcript_result.meta or {}
+            language = meta.get("language") if isinstance(meta, dict) else None
+            return transcript_result.segments, language if isinstance(
+                language, str
+            ) else None
 
         vocal = media.vocal_analysis(
             path,

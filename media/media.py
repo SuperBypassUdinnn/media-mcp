@@ -2391,6 +2391,7 @@ _VOCAL_PRESENCE_LYRICS_FLOOR = 0.15
 _VOCAL_INSTRUMENTAL_POSSIBLE_FLOOR = 0.3
 _VOCAL_TIMELINE_RMS_FRACTION = 0.30
 _VOCAL_TIMELINE_MIN_SPAN_S = 0.3
+_VOCAL_TIMELINE_BRIDGE_S = 0.3
 _VOCAL_BAND_PASS_LO_HZ = 150.0
 _VOCAL_BAND_PASS_HI_HZ = 1000.0
 _VOCAL_MODULATION_BAND_HZ = (4.0, 7.0)
@@ -2486,6 +2487,21 @@ def _vocal_timeline(vocals: np.ndarray, rate: int, hop: int = 512) -> list[list[
             if end_t - start_t >= _VOCAL_TIMELINE_MIN_SPAN_S:
                 spans.append([round(start_t, 3), round(end_t, 3)])
             run_start = None
+
+    # Bridge adjacent active spans separated by <= _VOCAL_TIMELINE_BRIDGE_S,
+    # then re-apply the minimum span filter after merging.
+    if len(spans) > 1:
+        bridged: list[list[float]] = [spans[0]]
+        for start, end in spans[1:]:
+            last = bridged[-1]
+            if start - last[1] <= _VOCAL_TIMELINE_BRIDGE_S:
+                last[1] = max(last[1], end)
+            else:
+                bridged.append([start, end])
+        spans = [
+            span for span in bridged if span[1] - span[0] >= _VOCAL_TIMELINE_MIN_SPAN_S
+        ]
+
     return spans
 
 
@@ -2545,11 +2561,16 @@ def _pyin_f0_confidence(
 
 
 def _vocal_type_from_transcript(
-    segments: list[dict[str, object]], vocal_presence: float
+    segments: list[dict[str, object]],
+    vocal_presence: float,
+    transcript_language: str | None = None,
 ) -> tuple[str, str | None, str | None]:
     """Decide vocal_type from confident transcript segments.
 
     Returns (vocal_type, language, transcript_sample).
+    `transcript_language` is the detected language from the transcript's
+    top-level meta and is used to fill `language` when the decision is
+    "lyrics".
     """
     confident: list[dict[str, object]] = []
     for segment in segments:
@@ -2573,12 +2594,13 @@ def _vocal_type_from_transcript(
         if text:
             confident.append(segment)
 
-    language = None
-    for segment in confident:
-        lang = segment.get("language")
-        if isinstance(lang, str) and lang.strip():
-            language = lang
-            break
+    language = transcript_language
+    if language is None:
+        for segment in confident:
+            lang = segment.get("language")
+            if isinstance(lang, str) and lang.strip():
+                language = lang
+                break
 
     tokens: list[str] = []
     for segment in confident:
@@ -2616,7 +2638,8 @@ def vocal_analysis(
     separate_bin: str | Path | None,
     scratch_dir: Path | None = None,
     cancel: threading.Event | None = None,
-    transcript_backend: Callable[[Path], list[dict[str, object]]] | None = None,
+    transcript_backend: Callable[[Path], tuple[list[dict[str, object]], str | None]]
+    | None = None,
 ) -> dict:
     """Run the vocal detection ladder on `pcm_path`.
 
@@ -2624,7 +2647,9 @@ def vocal_analysis(
     missing/broken runner degrades to rung 2.
     Rung 2: numpy autocorrelation F0 on band-passed 150-1000 Hz PCM.
     Rung 3: `vocal_type` decision via `transcript_backend` on the vocals stem
-    when `vocal_presence >= 0.15`.
+    when `vocal_presence >= 0.15`. `transcript_backend` returns
+    `(segments, detected_language)`; the detected language fills `language`
+    when `vocal_type` is "lyrics".
 
     Returns a dict with keys `vocal_presence`, `vocal_type`,
     `vocal_timeline`, `transcript_sample`, `language`,
@@ -2712,13 +2737,18 @@ def vocal_analysis(
     if vocal_presence >= _VOCAL_PRESENCE_LYRICS_FLOOR:
         stem_path = vocals_path if degraded_rung == "roformer" else pcm_path
         segments: list[dict[str, object]] = []
+        backend_language: str | None = None
         if transcript_backend is not None:
             try:
-                segments = transcript_backend(stem_path)
+                backend_result = transcript_backend(stem_path)
+                if isinstance(backend_result, tuple) and len(backend_result) == 2:
+                    segments, backend_language = backend_result
+                else:
+                    segments = backend_result
             except Exception:  # noqa: BLE001 - backend failure degrades
                 segments = []
         vocal_type, language, transcript_sample = _vocal_type_from_transcript(
-            segments, vocal_presence
+            segments, vocal_presence, backend_language
         )
 
     if (

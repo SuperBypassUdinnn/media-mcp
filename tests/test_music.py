@@ -439,51 +439,78 @@ def _run_vocal_analysis(
     )
 
 
-def _interjection_backend(_stem: Path) -> list[dict[str, object]]:
+def _interjection_backend(_stem: Path) -> tuple[list[dict[str, object]], str | None]:
     """Mock transcript backend returning interjection-dominated text."""
-    return [
-        {
-            "start": 0.0,
-            "end": 1.0,
-            "text": "wow",
-            "no_speech_prob": 0.1,
-            "avg_logprob": -0.2,
-        },
-        {
-            "start": 1.0,
-            "end": 2.0,
-            "text": "oh wow",
-            "no_speech_prob": 0.1,
-            "avg_logprob": -0.2,
-        },
-    ]
+    return (
+        [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": "wow",
+                "no_speech_prob": 0.1,
+                "avg_logprob": -0.2,
+            },
+            {
+                "start": 1.0,
+                "end": 2.0,
+                "text": "oh wow",
+                "no_speech_prob": 0.1,
+                "avg_logprob": -0.2,
+            },
+        ],
+        None,
+    )
 
 
-def _lyrics_backend(_stem: Path) -> list[dict[str, object]]:
+def _lyrics_backend(_stem: Path) -> tuple[list[dict[str, object]], str | None]:
     """Mock transcript backend returning confident real-word lyrics."""
-    return [
-        {
-            "start": 0.0,
-            "end": 2.0,
-            "text": "hello world this is my song",
-            "language": "en",
-            "no_speech_prob": 0.1,
-            "avg_logprob": -0.2,
-        }
-    ]
+    return (
+        [
+            {
+                "start": 0.0,
+                "end": 2.0,
+                "text": "hello world this is my song",
+                "language": "en",
+                "no_speech_prob": 0.1,
+                "avg_logprob": -0.2,
+            }
+        ],
+        "en",
+    )
 
 
-def _silent_backend(_stem: Path) -> list[dict[str, object]]:
+def _silent_backend(_stem: Path) -> tuple[list[dict[str, object]], str | None]:
     """Mock transcript backend returning nothing confident (all dropped)."""
-    return [
-        {
-            "start": 0.0,
-            "end": 1.0,
-            "text": "music",
-            "no_speech_prob": 0.9,
-            "avg_logprob": -2.0,
-        }
-    ]
+    return (
+        [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": "music",
+                "no_speech_prob": 0.9,
+                "avg_logprob": -2.0,
+            }
+        ],
+        None,
+    )
+
+
+def _no_guard_fields_backend(_stem: Path) -> tuple[list[dict[str, object]], str | None]:
+    """Mock transcript backend whose segments OMIT the guard fields.
+
+    Guards must pass through when fields are absent (backward compat).
+    """
+    return (
+        [
+            {"start": 0.0, "end": 1.0, "text": "hello"},
+            {"start": 1.0, "end": 2.0, "text": "world"},
+            {"start": 2.0, "end": 3.0, "text": "this"},
+            {"start": 3.0, "end": 4.0, "text": "is"},
+            {"start": 4.0, "end": 5.0, "text": "a"},
+            {"start": 5.0, "end": 6.0, "text": "song"},
+        ],
+        "en",
+    )
 
 
 def test_vocal_ladder_roformer_rung_via_fake(tmp_path, monkeypatch):
@@ -525,6 +552,43 @@ def test_vocal_type_lyrics_vs_instrumental(tmp_path, monkeypatch):
     )
     assert instrumental["vocal_type"] == "instrumental", instrumental
     assert instrumental["vocal_instrumental_possible"] is True, instrumental
+
+
+def test_vocal_type_missing_guard_fields_passes_through(tmp_path, monkeypatch):
+    """Segments without guard fields: guards pass through, decision still made."""
+    mix_path = _write_tone_wav(tmp_path / "mix.wav", 300.0, 4.0, amp=0.05)
+    result = _run_vocal_analysis(
+        tmp_path, mix_path, monkeypatch, transcript_backend=_no_guard_fields_backend
+    )
+    assert result["vocal_type"] == "lyrics", result
+    assert result["language"] == "en", result
+    assert result["transcript_sample"] is not None, result
+
+
+def test_vocal_type_lyrics_fills_language_from_top_level(tmp_path, monkeypatch):
+    """Lyrics path fills `language` from the transcript top-level, not segments."""
+    mix_path = _write_tone_wav(tmp_path / "mix.wav", 300.0, 4.0, amp=0.05)
+    result = _run_vocal_analysis(
+        tmp_path, mix_path, monkeypatch, transcript_backend=_lyrics_backend
+    )
+    # Segment carries `language: "en"` but top-level also returns "en";
+    # the top-level value is what fills `language` for the lyrics decision.
+    assert result["vocal_type"] == "lyrics", result
+    assert result["language"] == "en", result
+
+
+def test_vocal_timeline_bridging_merges_spans_0_2s_apart(tmp_path):
+    """Two active spans 0.2 s apart merge into one (bridge <= 0.3 s)."""
+    import numpy as np
+
+    rate = 22050
+    loud = np.full(int(rate * 0.5), 0.5)
+    quiet = np.zeros(int(rate * 0.2))
+    vocals = np.concatenate([loud, quiet, loud])
+    spans = media_mod._vocal_timeline(vocals, rate)
+    assert len(spans) == 1, spans
+    assert spans[0][0] == 0.0, spans
+    assert abs(spans[0][1] - 1.2) < 0.01, spans
 
 
 UVR_ROOT = (

@@ -157,6 +157,7 @@ def build_argv(
     device: str,
     queue_flag: bool,
     timeout_seconds: int,
+    condition_on_previous_text: bool = True,
 ) -> list[str]:
     """Build the pipeline invocation the contract requires.
 
@@ -175,6 +176,11 @@ def build_argv(
     policy (`queue="wait"` or `queue="fail"`) belongs to the server's
     single-flight lock, and the timeout is enforced by `run_child` when
     `run_transcript` runs the result.
+
+    `condition_on_previous_text` defaults to `True` (the current behavior,
+    so `media_transcript` consumers are unaffected). Passing `False` emits
+    `--no-condition-on-previous-text`, the hallucination guard required on
+    instrumental stems by spec section 6.
     """
     argv = [str(resolve_transcribe_bin()), str(source)]
     if isinstance(model, str) and model.strip() and model != "auto":
@@ -187,6 +193,10 @@ def build_argv(
         argv += ["--language", language]
     if isinstance(device, str) and device.strip():
         argv += ["--device", device]
+    if condition_on_previous_text:
+        argv.append("--condition-on-previous-text")
+    else:
+        argv.append("--no-condition-on-previous-text")
     argv += ["--out", str(out_dir)]
     return argv
 
