@@ -214,6 +214,14 @@ def _separate(
     model_cfg = dict(config.get("model", {}))
     stereo = bool(model_cfg.get("stereo", False))
     num_stems = int(model_cfg.get("num_stems", len(stems)))
+    if num_stems > len(stems):
+        print(
+            "roformer_runner: warning: checkpoint num_stems="
+            f"{num_stems} exceeds requested stems {stems}; dropping "
+            f"checkpoint output stems at indices "
+            f"{list(range(len(stems), num_stems))}",
+            file=sys.stderr,
+        )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
@@ -253,7 +261,9 @@ def _separate(
                 separated = model_obj(piece.unsqueeze(0)).squeeze(0)
                 # ``separated`` is (num_stems, channels, chunk), one tensor per
                 # stem in model output order; map them positionally to ``stems``.
-                for index in range(min(num_stems, separated.shape[0])):
+                # Clamp to len(stems) so a checkpoint config whose num_stems
+                # exceeds the requested stem list never indexes past ``stems``.
+                for index in range(min(num_stems, len(stems), separated.shape[0])):
                     name = stems[index]
                     buf = produced.setdefault(name, torch.zeros_like(audio))
                     buf[:, offset : offset + chunk] += separated[index].cpu()
