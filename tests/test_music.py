@@ -275,3 +275,132 @@ def test_media_music_missing_manifest_file(tmp_path, monkeypatch):
     missing = tmp_path / "does-not-exist.json"
     with pytest.raises(ToolError, match="manifest"):
         asyncio.run(server_mod.media_music(str(click_path), sfx_manifest=str(missing)))
+
+
+def _write_triad_cue(path: Path) -> Path:
+    """0.5 s C-major triad cue (C4/E4/G4)."""
+    total = int(RATE * 0.5)
+    samples = [0.0] * total
+    for freq in (261.63, 329.63, 392.00):
+        for index in range(total):
+            t = index / RATE
+            samples[index] += (1.0 / 3.0) * math.sin(2 * math.pi * freq * t)
+    return _write_wav(path, samples)
+
+
+def _write_tritone_cue(path: Path) -> Path:
+    """0.5 s tritone cue (C4 + F#4)."""
+    total = int(RATE * 0.5)
+    samples = [0.0] * total
+    for freq in (261.63, 369.99):
+        for index in range(total):
+            t = index / RATE
+            samples[index] += 0.5 * math.sin(2 * math.pi * freq * t)
+    return _write_wav(path, samples)
+
+
+def _write_duck_bed(path: Path, seconds: float = 2.0) -> Path:
+    """400 Hz sine bed amplitude-gated 0 dB / -12 dB at 2 Hz."""
+    total = int(RATE * seconds)
+    samples = [0.0] * total
+    for index in range(total):
+        t = index / RATE
+        amp = 1.0 if (math.floor(2 * 2 * t) % 2 == 0) else 10 ** (-12 / 20)
+        samples[index] = amp * 0.5 * math.sin(2 * math.pi * 400 * t)
+    return _write_wav(path, samples)
+
+
+def _write_music_bed(path: Path, seconds: float = 3.0) -> Path:
+    """3 s C-major pad used as the music source for key-clash tests."""
+    total = int(RATE * seconds)
+    samples = [0.0] * total
+    for freq in (261.63, 329.63, 392.00):
+        for index in range(total):
+            t = index / RATE
+            samples[index] += (1.0 / 3.0) * 0.4 * math.sin(2 * math.pi * freq * t)
+    return _write_wav(path, samples)
+
+
+def test_sfx_density_computation(tmp_path):
+    cue_paths = [_write_triad_cue(tmp_path / f"cue{i}.wav") for i in range(4)]
+    manifest = {
+        "cues": [
+            {"path": str(p), "start": i * 0.5, "gain": 1.0}
+            for i, p in enumerate(cue_paths)
+        ]
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    music_bed = _write_music_bed(tmp_path / "music.wav")
+    result = media_mod.detect_music(music_bed, wrapper=Path("/nonexistent"))
+    assert result.key == "C major"
+    scores = media_mod.mix_score_music(result, manifest, music_bed)
+    assert scores["sfx_density"] == 2.0, scores
+    assert scores["key_clash_score"] < 0.25, scores
+    assert scores["skipped_cues"] == [], scores
+
+
+def test_duck_pump_rate_detection(tmp_path):
+    music_bed = _write_music_bed(tmp_path / "music.wav", seconds=2.0)
+    duck_bed = _write_duck_bed(tmp_path / "duck.wav", seconds=2.0)
+    result = media_mod.detect_music(music_bed, wrapper=Path("/nonexistent"))
+    scores = media_mod.mix_score_music(result, [], duck_bed)
+    assert 1.5 <= scores["duck_pump_rate"] <= 2.5, scores
+
+
+def test_key_clash_score_triad_vs_dissonant(tmp_path):
+    music_bed = _write_music_bed(tmp_path / "music.wav")
+    triad_cue = _write_triad_cue(tmp_path / "triad.wav")
+    tritone_cue = _write_tritone_cue(tmp_path / "tritone.wav")
+    bad_cue = tmp_path / "not-audio.wav"
+    bad_cue.write_text("this is not audio", encoding="utf-8")
+    result = media_mod.detect_music(music_bed, wrapper=Path("/nonexistent"))
+    assert result.key == "C major", result
+
+    triad_manifest = {"cues": [{"path": str(triad_cue), "start": 0.0}]}
+    triad_score = media_mod.mix_score_music(result, triad_manifest, music_bed)
+    assert triad_score["key_clash_score"] < 0.25, triad_score
+
+    tritone_manifest = {"cues": [{"path": str(tritone_cue), "start": 0.0}]}
+    tritone_score = media_mod.mix_score_music(result, tritone_manifest, music_bed)
+    assert tritone_score["key_clash_score"] > triad_score["key_clash_score"], (
+        triad_score,
+        tritone_score,
+    )
+
+    mixed_manifest = {
+        "cues": [
+            {"path": str(triad_cue), "start": 0.0},
+            {"path": str(bad_cue), "start": 0.5},
+        ]
+    }
+    mixed_score = media_mod.mix_score_music(result, mixed_manifest, music_bed)
+    assert str(bad_cue) in mixed_score["skipped_cues"], mixed_score
+    assert mixed_score["key_clash_score"] == triad_score["key_clash_score"], (
+        mixed_score,
+        triad_score,
+    )
+
+
+def test_mix_block_in_music_json(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("MEDIA_CACHE_DIR", str(cache))
+    monkeypatch.setenv("MEDIA_MUSIC_BIN", str(Path("/nonexistent")))
+    music_bed = _write_music_bed(tmp_path / "music.wav")
+    triad_cue = _write_triad_cue(tmp_path / "triad.wav")
+    manifest = {"cues": [{"path": str(triad_cue), "start": 0.0}]}
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    text = asyncio.run(
+        server_mod.media_music(str(music_bed), sfx_manifest=str(manifest_path))
+    )
+    music_jsons = list(cache.rglob("music.json"))
+    assert len(music_jsons) == 1, music_jsons
+    payload = json.loads(music_jsons[0].read_text(encoding="utf-8"))
+    for field in ("sfx_density", "duck_pump_rate", "key_clash_score", "skipped_cues"):
+        assert field in payload, payload
+    assert "sfx_density:" in text, text
+    assert "duck_pump_rate:" in text, text
+    assert "key_clash_score:" in text, text
+    assert "PASS" in text or "FAIL" in text, text

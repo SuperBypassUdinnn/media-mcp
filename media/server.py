@@ -2973,6 +2973,21 @@ def _music_work(
         "source": resolved.source,
     }
     _write_json(entry / "music.json", payload)
+    mix = None
+    if sfx_manifest is not None:
+        manifest = json.loads(manifest_text)
+        mix = media.mix_score_music(
+            result,
+            manifest,
+            path,
+            scratch_dir=entry,
+            cancel=cancel,
+        )
+        payload["sfx_density"] = mix["sfx_density"]
+        payload["duck_pump_rate"] = mix["duck_pump_rate"]
+        payload["key_clash_score"] = mix["key_clash_score"]
+        payload["skipped_cues"] = mix["skipped_cues"]
+        _write_json(entry / "music.json", payload)
     _record_entry(entry, resolved)
     if result.key is None:
         lines = [
@@ -3022,6 +3037,28 @@ def _music_work(
         lines.append(f"Character: {', '.join(result.mood_tags)}")
     else:
         lines.append("Character: no mood tags detected")
+    if mix is not None:
+        density_ok = mix["sfx_density"] <= 1.2
+        pump_ok = mix["duck_pump_rate"] <= 2.0
+        clash = mix["key_clash_score"]
+        clash_ok = clash is None or clash <= 0.25
+        lines.append("")
+        lines.append("Mix gates:")
+        lines.append(
+            f"  sfx_density: {mix['sfx_density']:.3f} cues/s "
+            f"({'PASS' if density_ok else 'FAIL'} <= 1.2)"
+        )
+        lines.append(
+            f"  duck_pump_rate: {mix['duck_pump_rate']:.3f} pumps/s "
+            f"({'PASS' if pump_ok else 'FAIL'} <= 2.0)"
+        )
+        clash_text = "n/a (no music key)" if clash is None else f"{clash:.3f}"
+        lines.append(
+            f"  key_clash_score: {clash_text} "
+            f"({'PASS' if clash_ok else 'FAIL'} <= 0.25)"
+        )
+        if mix["skipped_cues"]:
+            lines.append(f"  skipped_cues: {', '.join(mix['skipped_cues'])}")
     lines.append("")
     lines.append("Arrangement:")
     for section in result.arrangement:

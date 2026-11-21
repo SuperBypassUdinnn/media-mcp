@@ -2151,6 +2151,232 @@ def detect_music(
     )
 
 
+_CUE_DURATION_S = 1.0  # assumed cue duration when a cue carries no decodable audio
+
+
+def _parse_sfx_manifest(manifest) -> list[dict]:
+    """Normalize an sfx manifest into a list of cue dicts.
+
+    Accepts either ``{"cues": [...]`` or a bare list of cue dicts. Each cue
+    requires ``path``; ``start`` (seconds) and ``gain`` (default 1.0) are
+    optional. Returns the normalized list; the caller validates existence.
+    """
+    if isinstance(manifest, dict):
+        cues = manifest.get("cues", [])
+    else:
+        cues = manifest
+    normalized: list[dict] = []
+    for cue in cues:
+        path = cue.get("path")
+        if path is None:
+            continue
+        normalized.append(
+            {
+                "path": path,
+                "start": float(cue["start"]) if cue.get("start") is not None else None,
+                "gain": float(cue.get("gain", 1.0)),
+            }
+        )
+    return normalized
+
+
+_CIRCLE_OF_FIFTHS = (0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5)
+_FIFTHS_POSITION = {pc: index for index, pc in enumerate(_CIRCLE_OF_FIFTHS)}
+
+
+def _fifths_distance(a: int, b: int) -> int:
+    """Shortest circle-of-fifths distance (semitones on the fifths wheel) between two pitch classes."""
+    diff = abs(_FIFTHS_POSITION[a % 12] - _FIFTHS_POSITION[b % 12])
+    return min(diff, 12 - diff)
+
+
+def _key_triad(key: str | None, mode: str | None) -> tuple[int, ...] | None:
+    """Return the pitch classes of the key's triad, or None when the key is unknown."""
+    if not key:
+        return None
+    name = key.split()[0]
+    try:
+        root = _KS_PITCH_CLASSES.index(name)
+    except ValueError:
+        return None
+    third = 4 if (mode or "major") == "major" else 3
+    return (root, (root + third) % 12, (root + 7) % 12)
+
+
+def _cue_clash(cue_path: Path, scratch_dir: Path | None, cancel) -> float | None:
+    """Dissonance of one cue against the key triad, or None when it cannot be decoded."""
+    try:
+        pcm = _decode_mono_pcm(cue_path, scratch_dir=scratch_dir, cancel=cancel)
+    except MediaError:
+        return None
+    if pcm.size == 0:
+        return None
+    spectrum, _seconds_per_bin = _music_stft(pcm)
+    harmonic = _median_filter(spectrum, _HPSS_TIME_KERNEL, axis=0)
+    chroma = _pitch_class_chroma(harmonic, _BEAT_SAMPLE_RATE, _BEAT_FRAME)
+    profile = chroma.mean(axis=1)
+    total = float(profile.sum())
+    if total <= 1e-12:
+        return None
+    return profile, total
+
+
+def _profile_clash(profile: np.ndarray, triad: tuple[int, ...]) -> float:
+    """Chroma-weighted circle-of-fifths dissonance against the triad, in [0, 1]."""
+    total = float(profile.sum())
+    if total <= 1e-12:
+        return 0.0
+    weighted = 0.0
+    for pc in range(12):
+        distance = min(_fifths_distance(pc, tone) for tone in triad)
+        weighted += float(profile[pc]) * (distance / 6.0)
+    return round(weighted / total, 6)
+
+
+def mix_score_music(
+    result,
+    manifest,
+    pcm_path: Path,
+    *,
+    scratch_dir: Path | None = None,
+    cancel: threading.Event | None = None,
+) -> dict:
+    """Score a music source against an sfx manifest.
+
+    Returns a dict with ``sfx_density`` (cues/s), ``duck_pump_rate`` (pumps/s),
+    ``key_clash_score`` (0..1, None when the music key is unknown) and
+    ``skipped_cues`` (cue paths that failed to decode, clash-neutral).
+    """
+    pcm_path = Path(pcm_path)
+    cues = _parse_sfx_manifest(manifest)
+    for cue in cues:
+        if not Path(cue["path"]).is_file():
+            raise MediaError(f"sfx cue not found: {cue['path']!r}")
+
+    # --- sfx density --------------------------------------------------------
+    # Decode each cue once: duration feeds the span, profile feeds the clash.
+    cue_data: list[dict] = []
+    skipped_cues: list[str] = []
+    starts: list[float] = []
+    ends: list[float] = []
+    for cue in cues:
+        start = cue["start"] if cue["start"] is not None else 0.0
+        clash = _cue_clash(Path(cue["path"]), scratch_dir, cancel)
+        if clash is None:
+            skipped_cues.append(str(cue["path"]))
+            duration = _CUE_DURATION_S
+            profile = None
+        else:
+            profile, _total = clash
+            duration = round(
+                float(clue_pcm_size(Path(cue["path"])) / _BEAT_SAMPLE_RATE), 6
+            )
+        starts.append(start)
+        ends.append(start + duration)
+        cue_data.append({"cue": cue, "profile": profile})
+    if starts:
+        span = max(ends) - min(starts)
+    else:
+        span = float(result.duration)
+    sfx_density = round(len(cues) / max(span, 0.1), 6)
+
+    # --- duck pump rate -----------------------------------------------------
+    mix_pcm = _decode_mono_pcm(pcm_path, scratch_dir=scratch_dir, cancel=cancel)
+    duck_pump_rate = _duck_pump_rate(mix_pcm)
+
+    # --- key clash ----------------------------------------------------------
+    triad = _key_triad(result.key, result.mode)
+    if triad is None:
+        key_clash_score = None
+    else:
+        cue_scores: list[float] = []
+        cue_weights: list[float] = []
+        for entry in cue_data:
+            profile = entry["profile"]
+            if profile is None:
+                continue  # clash-neutral: already in skipped_cues
+            weight = entry["cue"]["gain"]
+            cue_scores.append(_profile_clash(profile, triad) * weight)
+            cue_weights.append(weight)
+        key_clash_score = (
+            round(sum(cue_scores) / sum(cue_weights), 6) if cue_weights else 0.0
+        )
+
+    return {
+        "sfx_density": sfx_density,
+        "duck_pump_rate": duck_pump_rate,
+        "key_clash_score": key_clash_score,
+        "skipped_cues": skipped_cues,
+    }
+
+
+def clue_pcm_size(path: Path) -> int:
+    """Sample count of a decoded mono PCM file, or the assumed cue length."""
+    try:
+        return int(_decode_mono_pcm(Path(path)).size)
+    except MediaError:
+        return int(_CUE_DURATION_S * _BEAT_SAMPLE_RATE)
+
+
+def _duck_pump_rate(pcm: np.ndarray) -> float:
+    """pumps/s: depth of mid-band (200-2000 Hz) amplitude modulation.
+
+    Band-pass the decode via an STFT slice, build a 0.1 s RMS envelope, then
+    count local minima below 60% of adjacent local maxima spaced at least
+    0.5 Hz apart (>= 2 s between pumps).
+    """
+    import numpy as np
+    from scipy.signal import istft, stft
+
+    rate = _BEAT_SAMPLE_RATE
+    duration = pcm.size / rate
+    if duration < 0.2 or pcm.size < _BEAT_FRAME:
+        return 0.0
+    f, _t, Z = stft(pcm, fs=rate, nperseg=_BEAT_FRAME, noverlap=_BEAT_FRAME - _BEAT_HOP)
+    band = (f >= 200.0) & (f <= 2000.0)
+    masked = Z.copy()
+    masked[~band, :] = 0.0
+    _, reconstructed = istft(
+        masked, fs=rate, nperseg=_BEAT_FRAME, noverlap=_BEAT_FRAME - _BEAT_HOP
+    )
+    reconstructed = reconstructed[: pcm.size]
+    window = max(1, int(0.1 * rate))
+    hop = max(1, window // 2)
+    envelope: list[float] = []
+    for start in range(0, reconstructed.size - window + 1, hop):
+        chunk = reconstructed[start : start + window]
+        envelope.append(float(np.sqrt(np.mean(np.square(chunk)))))
+    envelope = np.array(envelope)
+    if envelope.size < 3:
+        return 0.0
+    maxima = np.array(
+        [
+            i
+            for i in range(1, envelope.size - 1)
+            if envelope[i] >= envelope[i - 1] and envelope[i] > envelope[i + 1]
+        ],
+        dtype=int,
+    )
+    minima = np.array(
+        [
+            i
+            for i in range(1, envelope.size - 1)
+            if envelope[i] <= envelope[i - 1] and envelope[i] < envelope[i + 1]
+        ],
+        dtype=int,
+    )
+    pumps = 0
+    for i in minima:
+        left = float(envelope[maxima[maxima < i]].max()) if np.any(maxima < i) else 0.0
+        right = float(envelope[maxima[maxima > i]].max()) if np.any(maxima > i) else 0.0
+        peak = max(left, right)
+        if peak <= 0:
+            continue
+        if envelope[i] < 0.6 * peak:
+            pumps += 1
+    return round(pumps / duration, 6)
+
+
 # ---------------------------------------------------------------------------
 # Audio-visual alignment: the zero-decode correlation behind media_avsync.
 #
