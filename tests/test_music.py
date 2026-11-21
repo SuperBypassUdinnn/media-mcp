@@ -21,6 +21,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from media import media as media_mod
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RATE = 22050
 CLICK_SECONDS = 10.0
@@ -186,3 +188,46 @@ def test_music_engine_arrangement_low_high(tmp_path):
     low_sections = [s for s in arrangement if s["level"] == "low"]
     assert low_sections, payload
     assert low_sections[-1]["end"] == round(payload["duration"], 3), payload
+
+
+def test_detect_music_librosa_engine(tmp_path):
+    path = _write_tonal_bed(tmp_path / "pad.wav")
+    result = media_mod.detect_music(path, wrapper=wrapper)
+    assert result.engine == "librosa"
+    assert result.degraded is False
+    assert result.key == "C major"
+    for name in (
+        "duration",
+        "key_confidence",
+        "harmonic_ratio",
+        "transient_density",
+        "onset_density",
+        "flux",
+        "low_band_ratio",
+        "loopiness",
+    ):
+        value = getattr(result, name)
+        assert value is not None and math.isfinite(value), (name, value)
+
+
+def test_detect_music_numpy_fallback(tmp_path):
+    path = _write_click_track(tmp_path / "clicks.wav")
+    result = media_mod.detect_music(path, wrapper=Path("/nonexistent"))
+    assert result.engine == "numpy"
+    assert result.degraded is True
+    # Later stages fill mix/vocals; the baseline leaves them unset.
+    assert result.mix is None and result.vocals is None
+    assert 0.0 <= result.harmonic_ratio <= 1.0
+    assert isinstance(result.mood_tags, tuple)
+    assert isinstance(result.arrangement, tuple)
+    # key may be None for a click track, but the contract fields are present.
+    for name in (
+        "duration",
+        "transient_density",
+        "onset_density",
+        "flux",
+        "low_band_ratio",
+        "loopiness",
+    ):
+        value = getattr(result, name)
+        assert value is not None and math.isfinite(value), (name, value)

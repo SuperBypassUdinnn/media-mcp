@@ -1788,6 +1788,369 @@ def detect_beats(
     )
 
 
+@dataclass(frozen=True)
+class MusicResult:
+    """One source's music-core analysis, engine-honest.
+
+    `engine` names what produced the numbers (`"librosa"` through the
+    rhythm/ virtualenv, `"numpy"` through the baseline here), and `degraded`
+    is True exactly when the baseline ran. `key`/`key_confidence`/`mode` are
+    the measured key (null when the source carries no chroma energy),
+    `harmonic_ratio` is the share of spectral energy in the harmonic part,
+    `transient_density`/`onset_density` count note boundaries per second,
+    `flux` is the mean positive spectral-flux step, `low_band_ratio` is the
+    share of energy in the 40-160 Hz band, `mood_tags` and `arrangement` are
+    rule-based character summaries, and `loopiness` is the self-similarity of
+    the chroma one bar back. `mix` and `vocals` are reserved for later
+    stages and are None here. Timestamps and durations are finite and
+    clamped to the decoded duration; nothing here is NaN.
+    """
+
+    engine: str
+    degraded: bool
+    duration: float
+    key: str | None
+    key_confidence: float | None
+    mode: str | None
+    harmonic_ratio: float
+    transient_density: float
+    onset_density: float
+    flux: float
+    low_band_ratio: float
+    mood_tags: tuple[str, ...]
+    arrangement: tuple[dict, ...]
+    loopiness: float
+    mix: dict | None = None
+    vocals: dict | None = None
+
+
+# Krumhansl-Kessler probe-tone profiles (Krumhansl & Kessler, 1982,
+# "Tracing the dynamic changes in perceived tonal organization in a spatial
+# representation of musical keys", Psychological Review). Each template is
+# the 12-pitch-class major/minor key profile; rotating a template by one
+# semitone gives the profile starting on the next tonic, so the 24 profiles
+# cover every major and minor key.
+_KS_MAJOR = (
+    6.35,
+    2.23,
+    3.48,
+    2.33,
+    4.38,
+    4.09,
+    2.59,
+    5.19,
+    2.39,
+    3.66,
+    2.29,
+    2.86,
+)
+_KS_MINOR = (
+    6.33,
+    2.68,
+    3.52,
+    5.38,
+    2.60,
+    3.53,
+    2.54,
+    4.75,
+    3.98,
+    2.69,
+    3.34,
+    3.17,
+)
+_KS_PITCH_CLASSES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+
+_HPSS_TIME_KERNEL = 5  # median-filter length along the time axis (harmonic)
+_HPSS_FREQ_KERNEL = 5  # median-filter length along the frequency axis (percussive)
+_BAR_SECONDS = 2.0  # bar length assumed for the loopiness lag (120 BPM, 4/4)
+
+
+def _ks_profiles() -> list[tuple[str, str, tuple[float, ...]]]:
+    """The 24 Krumhansl-Kessler major/minor key profiles.
+
+    For each of the twelve pitch classes, the major template and the minor
+    template are rotated so that class sits on the tonic; the profile
+    entries are the Krumhansl-Kessler probe-tone weights above.
+    """
+    profiles: list[tuple[str, str, tuple[float, ...]]] = []
+    for index, name in enumerate(_KS_PITCH_CLASSES):
+        profiles.append((name, "major", _KS_MAJOR[index:] + _KS_MAJOR[:index]))
+        profiles.append((name, "minor", _KS_MINOR[index:] + _KS_MINOR[:index]))
+    return profiles
+
+
+def _median_filter(magnitude: np.ndarray, kernel: int, axis: int) -> np.ndarray:
+    """Sliding-window median of `magnitude` along `axis`, same shape out.
+
+    Edges are extended with the boundary values, so the median near the start
+    and end of the axis is a local median rather than a shrinking-window
+    artifact. `kernel` is forced odd and at least 1.
+    """
+    import numpy as np
+
+    kernel = max(1, int(kernel) | 1)
+    pad = kernel // 2
+    pad_width = [(0, 0)] * magnitude.ndim
+    pad_width[axis] = (pad, pad)
+    padded = np.pad(magnitude, pad_width, mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, kernel, axis=axis)
+    return np.median(windows, axis=-1)
+
+
+def _pitch_class_chroma(
+    magnitude: np.ndarray, sample_rate: int, n_fft: int
+) -> np.ndarray:
+    """Fold STFT magnitude into 12 magnitude-weighted pitch classes per frame.
+
+    Bin center frequencies map to pitch classes via
+    `pc = (12 * log2(f / 440 Hz)) mod 12` (A4 = 440 Hz is pitch class 9,
+    so C lands at 0 after the modulo shift), and each bin's magnitude is
+    added to its class. Returns a (12, n_frames) matrix.
+    """
+    import numpy as np
+
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pitch_classes = (12.0 * np.log2(freqs / 440.0)) % 12.0
+    pitch_classes = np.nan_to_num(
+        pitch_classes, nan=0.0, posinf=0.0, neginf=0.0
+    ).astype(int)
+    chroma = np.zeros((12, magnitude.shape[0]), dtype=np.float64)
+    for frame in range(magnitude.shape[0]):
+        np.add.at(chroma[:, frame], pitch_classes, magnitude[frame])
+    return chroma
+
+
+def _correlate(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation of two equal-length vectors, 0.0 when degenerate."""
+    a = a - float(a.mean())
+    b = b - float(b.mean())
+    denom = math.sqrt(float((a * a).sum()) * float((b * b).sum()))
+    if denom <= 1e-12:
+        return 0.0
+    return float((a * b).sum()) / denom
+
+
+def _music_stft(pcm: np.ndarray) -> tuple[np.ndarray, float]:
+    """STFT magnitude of `pcm` with the beat layer's geometry.
+
+    Frames of `_BEAT_FRAME` samples hop `_BEAT_HOP` samples at
+    `_BEAT_SAMPLE_RATE`; returns the magnitude spectrum (513 bins x frames)
+    and the seconds per bin. Mirrors `_beat_envelope`'s STFT so the music
+    baseline and the beat baseline see identical frames.
+    """
+    import numpy as np
+
+    frame = _BEAT_FRAME
+    hop = _BEAT_HOP
+    if pcm.size < frame:
+        pcm = np.pad(pcm, (0, frame - pcm.size))
+    pad = frame - hop
+    padded = np.pad(pcm, (pad, 0))  # center the first window at sample zero
+    windows = np.lib.stride_tricks.sliding_window_view(padded, frame)[::hop]
+    spectrum = np.abs(np.fft.rfft(windows * np.hanning(frame), axis=1))
+    return spectrum, hop / _BEAT_SAMPLE_RATE
+
+
+def detect_music(
+    path: Path,
+    *,
+    wrapper: Path | None = None,
+    scratch_dir: Path | None = None,
+    cancel: threading.Event | None = None,
+) -> MusicResult:
+    """Analyze `path`'s music content, librosa first and the numpy baseline second.
+
+    When `wrapper` names an existing `rhythm/music.sh`, one child runs it
+    and its JSON stdout becomes a librosa-grade `MusicResult`. Any failure
+    of that route — missing venv, non-zero exit, unparseable output — falls
+    back to the pure-numpy baseline with `engine="numpy"` and
+    `degraded=True`, the grill-me D2 contract. `scratch_dir` receives the
+    fallback's transient PCM file (the source's cache entry in production).
+    No wrapper, or a source without an audio stream (an error either way),
+    never silently pretends to be librosa.
+
+    The numpy baseline decodes mono PCM through one ffmpeg pass, builds the
+    magnitude spectrogram with the beat layer's STFT geometry, and computes:
+    `harmonic_ratio` from a median-filter HPSS approximation (harmonic =
+    median along the time axis, percussive = median along the frequency axis,
+    energy ratio per Fitzgerald); `key`/`mode`/`key_confidence` from a
+    12-pitch-class fold of bin-center frequencies (magnitude-weighted)
+    correlated against the 24 Krumhansl-Kessler profiles — null key when the
+    source has no chroma energy; `transient_density`/`onset_density` from the
+    adaptive onset-pick over the spectral-flux envelope; `flux` as the mean
+    positive flux step; `low_band_ratio` from the 40-160 Hz bin slice; and
+    `mood_tags`, `arrangement`, and `loopiness` by the same rules as the
+    librosa engine.
+    """
+    path = Path(path)
+    if wrapper is not None and Path(wrapper).is_file():
+        done = run_child(["bash", str(wrapper), str(path)], cancel=cancel)
+        if done.returncode == 0 and done.stdout.strip():
+            try:
+                payload = json.loads(done.stdout)
+                key_confidence = payload.get("key_confidence")
+                return MusicResult(
+                    engine=str(payload.get("engine", "librosa")),
+                    degraded=bool(payload.get("degraded", False)),
+                    duration=float(payload.get("duration", 0.0)),
+                    key=payload.get("key"),
+                    key_confidence=(
+                        float(key_confidence) if key_confidence is not None else None
+                    ),
+                    mode=payload.get("mode"),
+                    harmonic_ratio=float(payload.get("harmonic_ratio", 0.0)),
+                    transient_density=float(payload.get("transient_density", 0.0)),
+                    onset_density=float(payload.get("onset_density", 0.0)),
+                    flux=float(payload.get("flux", 0.0)),
+                    low_band_ratio=float(payload.get("low_band_ratio", 0.0)),
+                    mood_tags=tuple(payload.get("mood_tags", [])),
+                    arrangement=tuple(payload.get("arrangement", [])),
+                    loopiness=float(payload.get("loopiness", 0.0)),
+                    mix=payload.get("mix"),
+                    vocals=payload.get("vocals"),
+                )
+            except (ValueError, TypeError, AttributeError):
+                pass  # unparseable stdout: fall through to the baseline
+    import numpy as np
+
+    pcm = _decode_mono_pcm(path, scratch_dir=scratch_dir, cancel=cancel)
+    duration = round(float(pcm.size / _BEAT_SAMPLE_RATE), 3)
+    envelope, seconds_per_bin, _band_fluxes = _beat_envelope(pcm)
+    onsets = _onset_pick(envelope, seconds_per_bin)
+    transient_density = round(len(onsets) / duration, 3) if duration > 0 else 0.0
+    onset_density = transient_density
+    flux = (
+        round(float(np.mean(np.maximum(0.0, np.diff(envelope)))), 3)
+        if envelope.size > 1
+        else 0.0
+    )
+
+    spectrum, _seconds_per_bin = _music_stft(pcm)
+    power = np.square(spectrum)
+    total_energy = float(power.sum())
+    freqs = np.fft.rfftfreq(_BEAT_FRAME, 1.0 / _BEAT_SAMPLE_RATE)
+    low_mask = (freqs >= 40.0) & (freqs <= 160.0)
+    low_band_ratio = (
+        round(float(power[:, low_mask].sum() / total_energy), 3)
+        if total_energy > 0
+        else 0.0
+    )
+
+    harmonic = _median_filter(spectrum, _HPSS_TIME_KERNEL, axis=1)
+    percussive = _median_filter(spectrum, _HPSS_FREQ_KERNEL, axis=0)
+    harmonic_energy = float(np.square(harmonic).sum())
+    percussive_energy = float(np.square(percussive).sum())
+    harmonic_ratio = (
+        round(harmonic_energy / (harmonic_energy + percussive_energy), 3)
+        if (harmonic_energy + percussive_energy) > 0
+        else 0.0
+    )
+
+    chroma = _pitch_class_chroma(spectrum, _BEAT_SAMPLE_RATE, _BEAT_FRAME)
+    profile = chroma.sum(axis=1)
+    key_value: str | None = None
+    mode_value: str | None = None
+    confidence_value: float | None = None
+    if float(profile.max()) > 1e-12:
+        best_name, best_mode, best_template = max(
+            _ks_profiles(),
+            key=lambda profile_: _correlate(
+                profile, np.array(profile_[2], dtype=np.float64)
+            ),
+        )
+        best_corr = _correlate(profile, np.array(best_template, dtype=np.float64))
+        key_value = f"{best_name} {best_mode}"
+        mode_value = best_mode
+        confidence_value = round(min(1.0, max(0.0, best_corr)), 3)
+
+    mood_tags: list[str] = []
+    if transient_density >= 4.0 and flux >= 1.0 and 0.3 <= low_band_ratio <= 0.8:
+        mood_tags.append("upbeat")
+    if mode_value == "major":
+        mood_tags.append("cheerful")
+    elif mode_value == "minor":
+        mood_tags.append("moody")
+    if transient_density < 2.0:
+        mood_tags.append("ambient")
+
+    n_win = max(1, math.ceil(duration))
+    rms: list[float] = []
+    for i in range(n_win):
+        start_sample = i * _BEAT_SAMPLE_RATE
+        stop_sample = min((i + 1) * _BEAT_SAMPLE_RATE, pcm.size)
+        if stop_sample > start_sample:
+            rms.append(
+                float(np.sqrt(np.mean(np.square(pcm[start_sample:stop_sample]))))
+            )
+        else:
+            rms.append(0.0)
+    median_rms = float(np.median(rms)) if rms else 0.0
+    low_thresh = 0.60 * median_rms
+    high_thresh = 1.30 * median_rms
+    levels: list[str] = []
+    for value in rms:
+        if value < low_thresh:
+            levels.append("low")
+        elif value > high_thresh:
+            levels.append("high")
+        else:
+            levels.append("mid")
+
+    arrangement: list[dict] = []
+    start = 0.0
+    prev_level = levels[0]
+    saw_high = False
+    for i in range(1, n_win + 1):
+        level = levels[i] if i < n_win else None
+        if level is None or level != prev_level:
+            end = float(i)
+            if prev_level == "high":
+                label = "body"
+                saw_high = True
+            elif prev_level == "low":
+                label = "breakdown" if saw_high else "intro"
+            else:
+                label = "mid"
+            arrangement.append(
+                {
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "level": prev_level,
+                    "label": label,
+                }
+            )
+            start = end
+            prev_level = level
+
+    bar_frames = max(1, int(_BAR_SECONDS * _BEAT_SAMPLE_RATE / _BEAT_HOP))
+    norms = np.linalg.norm(chroma, axis=0)
+    sims: list[float] = []
+    for i in range(bar_frames, chroma.shape[1]):
+        denom = float(norms[i] * norms[i - bar_frames])
+        if denom <= 1e-12:
+            continue
+        sims.append(float(np.dot(chroma[:, i], chroma[:, i - bar_frames]) / denom))
+    loopiness = round(float(np.mean(sims)), 3) if sims else 0.0
+
+    return MusicResult(
+        engine="numpy",
+        degraded=True,
+        duration=duration,
+        key=key_value,
+        key_confidence=confidence_value,
+        mode=mode_value,
+        harmonic_ratio=harmonic_ratio,
+        transient_density=transient_density,
+        onset_density=onset_density,
+        flux=flux,
+        low_band_ratio=low_band_ratio,
+        mood_tags=tuple(mood_tags),
+        arrangement=tuple(arrangement),
+        loopiness=loopiness,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Audio-visual alignment: the zero-decode correlation behind media_avsync.
 #
