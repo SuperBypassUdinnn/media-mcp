@@ -2946,9 +2946,6 @@ def _music_work(
             raise MediaError(
                 f"sfx manifest {sfx_manifest!r} is not valid JSON: {err}"
             ) from err
-            raise MediaError(
-                f"sfx manifest {sfx_manifest!r} is not valid JSON: {err}"
-            ) from err
     wrapper = Path(os.environ.get("MEDIA_MUSIC_BIN") or _MUSIC_WRAPPER)
     result = media.detect_music(path, wrapper=wrapper, scratch_dir=entry, cancel=cancel)
     if result.degraded:
@@ -2982,7 +2979,7 @@ def _music_work(
             "# media_music",
             "",
             f"Source: {resolved.source}",
-            f"Identity: {resolved.kind} {resolved.key}",
+            f"Identity: {resolved.kind} {resolved.key if resolved.key is not None else 'none detected'}",
             (
                 f"Engine: {result.engine}"
                 + (" (degraded pure-numpy fallback)" if result.degraded else "")
@@ -2999,12 +2996,12 @@ def _music_work(
             "# media_music",
             "",
             f"Source: {resolved.source}",
-            f"Identity: {resolved.kind} {resolved.key}",
+            f"Identity: {resolved.kind} {resolved.key if resolved.key is not None else 'none detected'}",
             (
                 f"Engine: {result.engine}"
                 + (" (degraded pure-numpy fallback)" if result.degraded else "")
             ),
-            f"Key: {result.key} ({result.mode}){confidence}",
+            f"Key: {result.key} ({result.mode if result.mode is not None else 'none detected'}){confidence}",
         ]
     ratio = result.harmonic_ratio
     if ratio > 0.55:
@@ -3025,11 +3022,6 @@ def _music_work(
         lines.append(f"Character: {', '.join(result.mood_tags)}")
     else:
         lines.append("Character: no mood tags detected")
-    lines.append("")
-    if result.mood_tags:
-        lines.append("Mood tags: " + ", ".join(result.mood_tags))
-    else:
-        lines.append("Mood tags: (none)")
     lines.append("")
     lines.append("Arrangement:")
     for section in result.arrangement:
