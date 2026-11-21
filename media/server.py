@@ -2890,6 +2890,165 @@ def _beats_work(
     return "\n".join(lines)
 
 
+_MUSIC_WRAPPER = Path(__file__).resolve().parent.parent / "rhythm" / "music.sh"
+
+
+async def media_music(
+    source: str,
+    sfx_manifest: str | None = None,
+    with_vocals: bool = False,
+    identity: str = "sampled",
+) -> str:
+    """Analyze a source's musicality and character.
+
+    Runs the rhythm/ `music.sh` pipeline (librosa in its own virtualenv) and
+    falls back to the pure-numpy baseline marked `degraded` when it is
+    unavailable. Writes `music.json` in the source's cache entry and names it
+    in the response. `sfx_manifest` opts into mix scoring (validated here;
+    scored in a later task), and `with_vocals=true` opts into the vocal
+    ladder (a later task).
+    """
+    return await _guarded(
+        lambda cancel: _music_work(
+            load_settings(), source, sfx_manifest, with_vocals, identity, cancel
+        )
+    )
+
+
+def _music_work(
+    settings: Settings,
+    source: str,
+    sfx_manifest: str | None,
+    with_vocals: bool,
+    identity: str,
+    cancel: threading.Event,
+) -> str:
+    """Run music detection, write music.json, and render the summary."""
+    del with_vocals  # the vocal ladder is a later task; the flag is accepted now
+    report = _Report()
+    resolved, path, entry, identity_note = _entry_for(
+        settings, source, identity, report
+    )
+    _record_identity_note(report, identity_note)
+    if sfx_manifest is not None:
+        manifest_path = Path(sfx_manifest)
+        if not manifest_path.is_file():
+            raise MediaError(f"sfx manifest not found: {sfx_manifest!r}")
+        try:
+            manifest_text = manifest_path.read_text(encoding="utf-8")
+        except OSError as err:
+            raise MediaError(
+                f"sfx manifest {sfx_manifest!r} could not be read: {err}"
+            ) from err
+        try:
+            json.loads(manifest_text)
+        except ValueError as err:
+            raise MediaError(
+                f"sfx manifest {sfx_manifest!r} is not valid JSON: {err}"
+            ) from err
+            raise MediaError(
+                f"sfx manifest {sfx_manifest!r} is not valid JSON: {err}"
+            ) from err
+    wrapper = Path(os.environ.get("MEDIA_MUSIC_BIN") or _MUSIC_WRAPPER)
+    result = media.detect_music(path, wrapper=wrapper, scratch_dir=entry, cancel=cancel)
+    if result.degraded:
+        report.skipped["librosa"] = (
+            "rhythm virtualenv unavailable; the pure-numpy baseline ran "
+            "(weaker key detection). Build it with rhythm/setup.sh."
+        )
+    else:
+        report.computed.append("music engine: librosa (rhythm/.venv)")
+    payload = {
+        "engine": result.engine,
+        "degraded": result.degraded,
+        "duration": result.duration,
+        "key": result.key,
+        "key_confidence": result.key_confidence,
+        "mode": result.mode,
+        "harmonic_ratio": result.harmonic_ratio,
+        "transient_density": result.transient_density,
+        "onset_density": result.onset_density,
+        "flux": result.flux,
+        "low_band_ratio": result.low_band_ratio,
+        "mood_tags": list(result.mood_tags),
+        "arrangement": [dict(section) for section in result.arrangement],
+        "loopiness": result.loopiness,
+        "source": resolved.source,
+    }
+    _write_json(entry / "music.json", payload)
+    _record_entry(entry, resolved)
+    if result.key is None:
+        lines = [
+            "# media_music",
+            "",
+            f"Source: {resolved.source}",
+            f"Identity: {resolved.kind} {resolved.key}",
+            (
+                f"Engine: {result.engine}"
+                + (" (degraded pure-numpy fallback)" if result.degraded else "")
+            ),
+            "Key: none detected (no tonal center)",
+        ]
+    else:
+        confidence = (
+            f" (confidence {result.key_confidence:.2f})"
+            if result.key_confidence is not None
+            else ""
+        )
+        lines = [
+            "# media_music",
+            "",
+            f"Source: {resolved.source}",
+            f"Identity: {resolved.kind} {resolved.key}",
+            (
+                f"Engine: {result.engine}"
+                + (" (degraded pure-numpy fallback)" if result.degraded else "")
+            ),
+            f"Key: {result.key} ({result.mode}){confidence}",
+        ]
+    ratio = result.harmonic_ratio
+    if ratio > 0.55:
+        interpretation = "harmonic-dominated: tonal, pitched content"
+    elif ratio < 0.4:
+        interpretation = "percussive-dominated: transients, little tonal content"
+    else:
+        interpretation = "mixed harmonic and percussive energy"
+    lines += [
+        f"Harmonic ratio: {ratio:.2f} ({interpretation})",
+        (
+            f"Transient density: {result.transient_density:.2f} "
+            "note boundaries per second"
+        ),
+        (f"Onset density: {result.onset_density:.2f} onsets per second"),
+    ]
+    if result.mood_tags:
+        lines.append(f"Character: {', '.join(result.mood_tags)}")
+    else:
+        lines.append("Character: no mood tags detected")
+    lines.append("")
+    if result.mood_tags:
+        lines.append("Mood tags: " + ", ".join(result.mood_tags))
+    else:
+        lines.append("Mood tags: (none)")
+    lines.append("")
+    lines.append("Arrangement:")
+    for section in result.arrangement:
+        lines.append(
+            "  {start} - {end}  {level}".format(
+                start=artifacts.format_timestamp(section["start"]),
+                end=artifacts.format_timestamp(section["end"]),
+                level=section.get("level", "?"),
+            )
+        )
+    lines += [
+        "",
+        f"Artifact: {entry / 'music.json'}",
+        "",
+        report.status(),
+    ]
+    return "\n".join(lines)
+
+
 def _ensure_scenes_only(
     entry: Path, path: Path, report: _Report
 ) -> list[media.SceneScore]:
@@ -3167,6 +3326,21 @@ _TOOL_DESCRIPTIONS = {
         "inconclusive verdict. Zero decodes on a warm cache. Writes "
         "sync.json in the source's entry and names it in the response."
     ),
+    "media_music": (
+        "Measure a source's musicality and character: key and mode with "
+        "confidence, the harmonic ratio, transient and onset density, flux, "
+        "the low-band ratio, mood tags, and an arrangement table. Runs the "
+        "rhythm/ `music.sh` pipeline (librosa in its own virtualenv) and "
+        "falls back to a pure-numpy baseline marked `degraded` when it is "
+        "missing. Writes `music.json` in the source's cache entry and names "
+        "it in the response; the harmonic ratio reads above 0.55 as "
+        "harmonic-dominated and below 0.4 as percussive-dominated. "
+        "`sfx_manifest` opts into mix scoring with the pinned gates "
+        "(sfx_density at most 1.2, duck_pump at most 2 per scene, key_clash "
+        "at most 0.25); this call validates the manifest's path and JSON, "
+        "with full scoring a later task. `with_vocals=true` opts into the "
+        "vocal ladder, also a later task."
+    ),
     "media_cache": (
         "Report the artifact cache: `list` shows the entry table, `stats` shows "
         "total_bytes against the cap plus the transcription dependency self-check, "
@@ -3196,6 +3370,7 @@ def build_server() -> MCPServer:
         media_image_sort,
         media_motion,
         media_beats,
+        media_music,
         media_avsync,
         media_cache,
     ):

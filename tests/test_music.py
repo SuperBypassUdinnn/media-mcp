@@ -13,6 +13,7 @@ virtualenv exists and skips the librosa-specific assertions when it does not.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import wave
@@ -20,7 +21,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
+import media.server as server_mod
 from media import media as media_mod
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -237,3 +240,38 @@ def test_detect_music_numpy_fallback(tmp_path):
     ):
         value = getattr(result, name)
         assert value is not None and math.isfinite(value), (name, value)
+
+
+def test_media_music_tool_artifact(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("MEDIA_CACHE_DIR", str(cache))
+    monkeypatch.setenv("MEDIA_MUSIC_BIN", str(wrapper))
+    click_path = _write_click_track(tmp_path / "clicks.wav")
+    text = asyncio.run(server_mod.media_music(str(click_path)))
+    assert text.startswith("# media_music\n"), text
+    music_jsons = list(cache.rglob("music.json"))
+    assert len(music_jsons) == 1, music_jsons
+    assert str(music_jsons[0]) in text, text
+    assert "Artifact:" in text, text
+    payload = json.loads(music_jsons[0].read_text(encoding="utf-8"))
+    for field in (
+        "engine",
+        "key",
+        "harmonic_ratio",
+        "duration",
+        "mood_tags",
+        "arrangement",
+    ):
+        assert field in payload, payload
+
+
+def test_media_music_missing_manifest_file(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("MEDIA_CACHE_DIR", str(cache))
+    monkeypatch.setenv("MEDIA_MUSIC_BIN", str(wrapper))
+    click_path = _write_click_track(tmp_path / "clicks.wav")
+    missing = tmp_path / "does-not-exist.json"
+    with pytest.raises(ToolError, match="manifest"):
+        asyncio.run(server_mod.media_music(str(click_path), sfx_manifest=str(missing)))
