@@ -14,8 +14,10 @@ virtualenv exists and skips the librosa-specific assertions when it does not.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import math
+import os
 import wave
 from pathlib import Path
 
@@ -591,30 +593,67 @@ def test_vocal_timeline_bridging_merges_spans_0_2s_apart(tmp_path):
     assert abs(spans[0][1] - 1.2) < 0.01, spans
 
 
-UVR_ROOT = (
-    Path.home() / ".clone" / "Github" / "SuperBypassUdinnn" / "ultimatevocalremovergui"
+def _resolve_uvr_root() -> Path | None:
+    """Resolve the UVR root with the runner's order (env → glob → default).
+
+    Returns None when nothing resolves so the smoke test auto-skips on CI.
+    The runner module is import-safe without torch, so exec'ing it here is
+    cheap and keeps the test's root resolution aligned with _uvr_root().
+    """
+    spec = importlib.util.spec_from_file_location(
+        "roformer_runner", REPO_ROOT / "separators" / "roformer_runner.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 - any exec failure means the runner is unavailable
+        return None
+    try:
+        return module._uvr_root()
+    except FileNotFoundError:
+        return None
+
+
+_UVR_ROOT = _resolve_uvr_root()
+_UVR_VENV = _UVR_ROOT / ".venv" / "bin" / "python" if _UVR_ROOT is not None else None
+_VOCALS_CKPT = (
+    _UVR_ROOT
+    / "models"
+    / "MDX_Net_Models"
+    / "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+    if _UVR_ROOT is not None
+    else None
 )
-UVR_VENV = UVR_ROOT / ".venv" / "bin" / "python"
-VOCALS_CKPT = UVR_ROOT / "checkpoints" / "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+
+
+def _uvr_smoke_available() -> bool:
+    return bool(
+        _UVR_VENV is not None
+        and _UVR_VENV.exists()
+        and _VOCALS_CKPT is not None
+        and _VOCALS_CKPT.exists()
+    )
 
 
 @pytest.mark.skipif(
-    not UVR_VENV.exists() or not VOCALS_CKPT.exists(),
+    not _uvr_smoke_available(),
     reason="UVR venv or vocals checkpoint absent (CI-safe skip)",
 )
 def test_roformer_runner_smoke_skipped_when_no_venv(tmp_path):
     """Real-runner smoke test; skipped when UVR venv/checkpoint absent."""
     import subprocess
 
+    assert _UVR_VENV is not None and _UVR_ROOT is not None
     mix_path = _write_tone_wav(tmp_path / "mix.wav", 300.0, 3.0, amp=0.5)
     out_dir = tmp_path / "stems"
     done = subprocess.run(
         [
-            str(UVR_VENV),
+            str(_UVR_VENV),
             str(REPO_ROOT / "separators" / "roformer_runner.py"),
             str(mix_path),
             str(out_dir),
         ],
+        env={**os.environ, "UVR_ROOT": str(_UVR_ROOT)},
         check=False,
         capture_output=True,
         text=True,
