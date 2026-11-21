@@ -2924,7 +2924,6 @@ def _music_work(
     cancel: threading.Event,
 ) -> str:
     """Run music detection, write music.json, and render the summary."""
-    del with_vocals  # the vocal ladder is a later task; the flag is accepted now
     report = _Report()
     resolved, path, entry, identity_note = _entry_for(
         settings, source, identity, report
@@ -2986,6 +2985,45 @@ def _music_work(
         payload["duck_pump_rate"] = mix["duck_pump_rate"]
         payload["key_clash_score"] = mix["key_clash_score"]
         payload["skipped_cues"] = mix["skipped_cues"]
+
+    # --- Vocal ladder ------------------------------------------------------
+    vocal = None
+    if with_vocals:
+        separate_bin = os.environ.get("MEDIA_SEPARATE_BIN")
+
+        def _transcribe_backend(stem_path: Path) -> list[dict[str, object]]:
+            """Transcribe the vocals stem through the existing transcribe backend."""
+            out_dir = entry / "transcribe-stem"
+            _empty_dir(out_dir)
+            argv = contracts.build_argv(
+                str(stem_path),
+                out_dir,
+                "tiny",
+                0,
+                "auto",
+                "cpu",
+                False,
+                settings.call_timeout_seconds,
+            )
+            transcript_result = contracts.run_transcript(
+                argv, settings.call_timeout_seconds, cancel
+            )
+            return transcript_result.segments
+
+        vocal = media.vocal_analysis(
+            path,
+            separate_bin=separate_bin,
+            scratch_dir=entry,
+            cancel=cancel,
+            transcript_backend=_transcribe_backend,
+        )
+        payload["vocal_presence"] = vocal["vocal_presence"]
+        payload["vocal_type"] = vocal["vocal_type"]
+        payload["vocal_timeline"] = vocal["vocal_timeline"]
+        payload["transcript_sample"] = vocal["transcript_sample"]
+        payload["language"] = vocal["language"]
+        payload["vocal_instrumental_possible"] = vocal["vocal_instrumental_possible"]
+        payload["degraded_rung"] = vocal["degraded_rung"]
     _write_json(entry / "music.json", payload)
     _record_entry(entry, resolved)
     if result.key is None:
@@ -3068,6 +3106,27 @@ def _music_work(
                 level=section.get("level", "?"),
             )
         )
+    if vocal is not None:
+        lines.append("")
+        lines.append(
+            f"Vocals: {vocal['vocal_presence']:.3f} {vocal['vocal_type']} "
+            f"({vocal['degraded_rung']})"
+        )
+        if vocal["vocal_timeline"]:
+            preview = "; ".join(
+                f"{artifacts.format_timestamp(start)}-{artifacts.format_timestamp(end)}"
+                for start, end in vocal["vocal_timeline"][:4]
+            )
+            lines.append(f"Vocal timeline: {preview}")
+        if vocal["transcript_sample"]:
+            lines.append(
+                f"Transcript sample: {vocal['transcript_sample']}"
+                + (f" (language {vocal['language']})" if vocal["language"] else "")
+            )
+        if vocal["vocal_instrumental_possible"]:
+            lines.append(
+                "Note: high vocal presence but no confident speech; review as possible instrumental."
+            )
     lines += [
         "",
         f"Artifact: {entry / 'music.json'}",

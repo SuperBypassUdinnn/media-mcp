@@ -2376,6 +2376,369 @@ def _duck_pump_rate(pcm: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Vocal detection ladder: Roformer separation -> pyin fallback -> Whisper.
+#
+# Opt-in through `media_music(with_vocals=True)`. Each rung degrades
+# gracefully and reports which rung produced the verdict.
+# ---------------------------------------------------------------------------
+
+_VOCAL_INTERJECTIONS = frozenset(
+    {"wow", "oh", "yeah", "ah", "la", "na", "hey", "ooh", "uh"}
+)
+
+_VOCAL_CONFIDENT_TOKEN_MIN = 5
+_VOCAL_PRESENCE_LYRICS_FLOOR = 0.15
+_VOCAL_INSTRUMENTAL_POSSIBLE_FLOOR = 0.3
+_VOCAL_TIMELINE_RMS_FRACTION = 0.30
+_VOCAL_TIMELINE_MIN_SPAN_S = 0.3
+_VOCAL_BAND_PASS_LO_HZ = 150.0
+_VOCAL_BAND_PASS_HI_HZ = 1000.0
+_VOCAL_MODULATION_BAND_HZ = (4.0, 7.0)
+
+
+@dataclass(frozen=True)
+class VocalResult:
+    """One source's vocal analysis, engine-honest."""
+
+    vocal_presence: float
+    vocal_type: str
+    vocal_timeline: list[list[float]]
+    transcript_sample: str | None
+    language: str | None
+    vocal_instrumental_possible: bool
+    degraded_rung: str
+
+
+def _pcm_rms(samples: np.ndarray) -> float:
+    """Root-mean-square of float samples in [-1, 1]."""
+    import numpy as np
+
+    if samples.size == 0:
+        return 0.0
+    return float(np.sqrt(float(np.mean(np.square(samples)))))
+
+
+def _load_mono_wav(path: Path) -> tuple[np.ndarray, int]:
+    """Decode a mono WAV `path` to float64 PCM and return (samples, sample_rate).
+
+    Reads 16-bit PCM through the stdlib `wave` module so no extra dependency
+    (soundfile, librosa) is required in media/.venv.
+    """
+    import wave
+
+    import numpy as np
+
+    with wave.open(str(path), "rb") as handle:
+        channels = handle.getnchannels()
+        width = handle.getsampwidth()
+        rate = handle.getframerate()
+        frames = handle.getnframes()
+        raw = handle.readframes(frames)
+    if width == 2:
+        samples = np.frombuffer(raw, dtype="<i2").astype(np.float64) / 32768.0
+    elif width == 1:
+        samples = (
+            np.frombuffer(raw, dtype=np.uint8).astype(np.float64) - 128.0
+        ) / 128.0
+    elif width == 4:
+        samples = np.frombuffer(raw, dtype="<i4").astype(np.float64) / 2147483648.0
+    else:
+        raise MediaError(f"unsupported WAV sample width {width} in {path}")
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    return samples, rate
+
+
+def _vocal_timeline(vocals: np.ndarray, rate: int, hop: int = 512) -> list[list[float]]:
+    """Active-vocal spans where vocals-RMS clears 30% of its own 90th percentile.
+
+    Spans are >= `_VOCAL_TIMELINE_MIN_SPAN_S` and gaps of one hop are bridged.
+    Returns [[start, end], ...] in seconds, rounded to 3 decimals.
+    """
+    import numpy as np
+
+    if vocals.size == 0:
+        return []
+    window = max(1, hop)
+    rms: list[float] = []
+    times: list[float] = []
+    for start in range(0, vocals.size, hop):
+        chunk = vocals[start : start + window]
+        if chunk.size == 0:
+            break
+        rms.append(_pcm_rms(chunk))
+        times.append(start / rate)
+    if not rms:
+        return []
+    rms = np.array(rms, dtype=np.float64)
+    threshold = float(np.percentile(rms, 90)) * _VOCAL_TIMELINE_RMS_FRACTION
+    active = rms > threshold
+    spans: list[list[float]] = []
+    run_start: int | None = None
+    for index in range(active.size + 1):
+        is_active = index < active.size and bool(active[index])
+        if is_active:
+            if run_start is None:
+                run_start = index
+        elif run_start is not None:
+            start_t = times[run_start]
+            end_t = times[index - 1] + window / rate
+            if end_t - start_t >= _VOCAL_TIMELINE_MIN_SPAN_S:
+                spans.append([round(start_t, 3), round(end_t, 3)])
+            run_start = None
+    return spans
+
+
+def _band_pass_150_1000(pcm: np.ndarray, rate: int) -> np.ndarray:
+    """Band-pass `pcm` to 150-1000 Hz via an FFT magnitude mask."""
+    import numpy as np
+
+    spectrum = np.fft.rfft(pcm)
+    freqs = np.fft.rfftfreq(pcm.size, 1.0 / rate)
+    mask = (freqs >= _VOCAL_BAND_PASS_LO_HZ) & (freqs <= _VOCAL_BAND_PASS_HI_HZ)
+    spectrum = spectrum * mask
+    return np.fft.irfft(spectrum, n=pcm.size)
+
+
+def _pyin_f0_confidence(
+    pcm: np.ndarray, rate: int, frame: int = 2048, hop: int = 512
+) -> tuple[np.ndarray, np.ndarray]:
+    """Autocorrelation F0 with peak-prominence confidence on band-passed PCM.
+
+    Returns (f0_hz, confidence) per frame, confidence in 0..1 from the
+    prominence of the autocorrelation peak relative to the frame energy.
+    """
+    import numpy as np
+
+    band = _band_pass_150_1000(pcm, rate)
+    if band.size < frame:
+        band = np.pad(band, (0, frame - band.size))
+    n_frames = max(0, (band.size - frame) // hop + 1)
+    if n_frames == 0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    freqs_lo = rate / 1000.0
+    freqs_hi = rate / 150.0
+    lag_lo = max(1, round(freqs_lo))
+    lag_hi = min(frame - 1, round(freqs_hi))
+    if lag_hi <= lag_lo:
+        lag_hi = lag_lo + 1
+    f0 = np.zeros(n_frames, dtype=np.float64)
+    conf = np.zeros(n_frames, dtype=np.float64)
+    window = np.hanning(frame)
+    for index in range(n_frames):
+        chunk = band[index * hop : index * hop + frame] * window
+        energy = float(np.sum(np.square(chunk)))
+        if energy <= 1e-12:
+            continue
+        autocorr = np.correlate(chunk, chunk, mode="full")[frame - 1 :]
+        band_autocorr = autocorr[lag_lo : lag_hi + 1]
+        if band_autocorr.size == 0:
+            continue
+        peak = int(np.argmax(band_autocorr))
+        peak_lag = lag_lo + peak
+        peak_value = float(band_autocorr[peak])
+        prominence = peak_value - float(np.mean(band_autocorr))
+        if peak_lag > 0 and prominence > 0:
+            f0[index] = rate / float(peak_lag)
+            conf[index] = min(1.0, prominence / (energy + 1e-12))
+    return f0, conf
+
+
+def _vocal_type_from_transcript(
+    segments: list[dict[str, object]], vocal_presence: float
+) -> tuple[str, str | None, str | None]:
+    """Decide vocal_type from confident transcript segments.
+
+    Returns (vocal_type, language, transcript_sample).
+    """
+    confident: list[dict[str, object]] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        no_speech = segment.get("no_speech_prob")
+        avg_logprob = segment.get("avg_logprob")
+        if no_speech is not None:
+            try:
+                if float(no_speech) > 0.6:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if avg_logprob is not None:
+            try:
+                if float(avg_logprob) < -1.0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        text = str(segment.get("text", "")).strip()
+        if text:
+            confident.append(segment)
+
+    language = None
+    for segment in confident:
+        lang = segment.get("language")
+        if isinstance(lang, str) and lang.strip():
+            language = lang
+            break
+
+    tokens: list[str] = []
+    for segment in confident:
+        text = str(segment.get("text", "")).strip()
+        for token in text.split():
+            token = token.strip(".,!?;:\"'()[]{}").lower()
+            if token:
+                tokens.append(token)
+
+    unique = []
+    for token in tokens:
+        if token not in unique:
+            unique.append(token)
+
+    interjection_tokens = [t for t in unique if t in _VOCAL_INTERJECTIONS]
+    repetition = 1.0 - (len(unique) / max(1, len(tokens)))
+
+    if (
+        len(unique) >= _VOCAL_CONFIDENT_TOKEN_MIN
+        and len(interjection_tokens) <= len(unique) // 2
+        and repetition < 0.6
+    ):
+        sample = " ".join(unique[:8])
+        return "lyrics", language, sample
+    if unique:
+        return "vocalization", language, " ".join(unique[:8])
+    if vocal_presence >= _VOCAL_INSTRUMENTAL_POSSIBLE_FLOOR:
+        return "instrumental", None, None
+    return "instrumental", None, None
+
+
+def vocal_analysis(
+    pcm_path: Path,
+    *,
+    separate_bin: str | Path | None,
+    scratch_dir: Path | None = None,
+    cancel: threading.Event | None = None,
+    transcript_backend: Callable[[Path], list[dict[str, object]]] | None = None,
+) -> dict:
+    """Run the vocal detection ladder on `pcm_path`.
+
+    Rung 1: invoke `separate_bin <wav> <scratch_dir>` (Roformer separation);
+    missing/broken runner degrades to rung 2.
+    Rung 2: numpy autocorrelation F0 on band-passed 150-1000 Hz PCM.
+    Rung 3: `vocal_type` decision via `transcript_backend` on the vocals stem
+    when `vocal_presence >= 0.15`.
+
+    Returns a dict with keys `vocal_presence`, `vocal_type`,
+    `vocal_timeline`, `transcript_sample`, `language`,
+    `vocal_instrumental_possible`, `degraded_rung`.
+    """
+    pcm_path = Path(pcm_path)
+    scratch = Path(scratch_dir) if scratch_dir is not None else Path(tempfile.mkdtemp())
+    scratch.mkdir(parents=True, exist_ok=True)
+
+    vocals_path = scratch / "vocals.wav"
+    degraded_rung = "pyin"
+
+    # --- Rung 1: Roformer separation -------------------------------------
+    separate_bin_path = Path(separate_bin) if separate_bin else None
+    if separate_bin_path and separate_bin_path.is_file():
+        try:
+            done = run_child(
+                [str(separate_bin_path), str(pcm_path), str(scratch)],
+                cancel=cancel,
+            )
+            if done.returncode == 0 and vocals_path.is_file():
+                degraded_rung = "roformer"
+        except MediaError:
+            pass
+
+    # --- Rung 2: pyin fallback -------------------------------------------
+    mix_pcm = _decode_mono_pcm(pcm_path, scratch_dir=scratch, cancel=cancel)
+    rate = _BEAT_SAMPLE_RATE
+    mix_rms = _pcm_rms(mix_pcm)
+    vocal_presence = 0.0
+    vocal_timeline: list[list[float]] = []
+    vocals_pcm: np.ndarray | None = None
+
+    if degraded_rung == "roformer" and vocals_path.is_file():
+        vocals_pcm, vocals_rate = _load_mono_wav(vocals_path)
+        if vocals_rate != rate:
+            import numpy as np
+
+            ratio = rate / vocals_rate
+            vocals_pcm = np.interp(
+                np.linspace(0, vocals_pcm.size, int(vocals_pcm.size * ratio)),
+                np.arange(vocals_pcm.size),
+                vocals_pcm,
+            )
+        vocal_rms = _pcm_rms(vocals_pcm)
+        vocal_presence = (
+            round(min(1.0, (vocal_rms**2) / (mix_rms**2)), 6) if mix_rms > 0 else 0.0
+        )
+        vocal_timeline = _vocal_timeline(vocals_pcm, rate)
+    else:
+        # Pyin fallback: confident-F0 coverage on the band-passed mix.
+        import numpy as np
+
+        _f0, conf = _pyin_f0_confidence(mix_pcm, rate)
+        if conf.size:
+            coverage = float(np.mean(conf > 0.5))
+            modulation = 0.0
+            if conf.size > 2:
+                modulation = float(np.std(conf)) / max(0.1, float(np.mean(conf)))
+            vocal_presence = round(min(1.0, coverage * (0.5 + 0.5 * modulation)), 6)
+            # Timeline from the confident frames (contiguous covered spans).
+            step = 512.0 / rate
+            covered = conf > 0.5
+            spans: list[list[float]] = []
+            run_start: int | None = None
+            for index in range(covered.size + 1):
+                is_active = index < covered.size and bool(covered[index])
+                if is_active:
+                    if run_start is None:
+                        run_start = index
+                elif run_start is not None:
+                    start_t = run_start * step
+                    end_t = (index - 1) * step + step
+                    if end_t - start_t >= _VOCAL_TIMELINE_MIN_SPAN_S:
+                        spans.append([round(start_t, 3), round(end_t, 3)])
+                    run_start = None
+            vocal_timeline = spans
+
+    # --- Rung 3: vocal_type via transcript backend -----------------------
+    vocal_type = "instrumental"
+    transcript_sample: str | None = None
+    language: str | None = None
+    vocal_instrumental_possible = False
+
+    if vocal_presence >= _VOCAL_PRESENCE_LYRICS_FLOOR:
+        stem_path = vocals_path if degraded_rung == "roformer" else pcm_path
+        segments: list[dict[str, object]] = []
+        if transcript_backend is not None:
+            try:
+                segments = transcript_backend(stem_path)
+            except Exception:  # noqa: BLE001 - backend failure degrades
+                segments = []
+        vocal_type, language, transcript_sample = _vocal_type_from_transcript(
+            segments, vocal_presence
+        )
+
+    if (
+        vocal_type == "instrumental"
+        and vocal_presence >= _VOCAL_INSTRUMENTAL_POSSIBLE_FLOOR
+    ):
+        vocal_instrumental_possible = True
+
+    return {
+        "vocal_presence": vocal_presence,
+        "vocal_type": vocal_type,
+        "vocal_timeline": vocal_timeline,
+        "transcript_sample": transcript_sample,
+        "language": language,
+        "vocal_instrumental_possible": vocal_instrumental_possible,
+        "degraded_rung": degraded_rung,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Audio-visual alignment: the zero-decode correlation behind media_avsync.
 #
 # Pure post-processing over timestamps the earlier layers already measured:

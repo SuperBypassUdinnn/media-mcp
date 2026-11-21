@@ -404,3 +404,158 @@ def test_mix_block_in_music_json(tmp_path, monkeypatch):
     assert "duck_pump_rate:" in text, text
     assert "key_clash_score:" in text, text
     assert "PASS" in text or "FAIL" in text, text
+
+
+def _write_tone_wav(path: Path, freq: float, seconds: float, amp: float = 0.5) -> Path:
+    """Write a mono sine tone of `freq` Hz for `seconds` at `amp` amplitude."""
+    total = int(RATE * seconds)
+    samples = [
+        amp * math.sin(2 * math.pi * freq * index / RATE) for index in range(total)
+    ]
+    return _write_wav(path, samples)
+
+
+FAKE_SEPARATE = REPO_ROOT / "tests" / "fake_separate.sh"
+
+
+def _run_vocal_analysis(
+    tmp_path: Path,
+    mix_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    separate_bin: str | Path | None = FAKE_SEPARATE,
+    transcript_backend=None,
+) -> dict:
+    """Run vocal_analysis with `separate_bin` and a scratch dir under tmp_path."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    if separate_bin is not None:
+        monkeypatch.setenv("MEDIA_SEPARATE_BIN", str(separate_bin))
+    return media_mod.vocal_analysis(
+        mix_path,
+        separate_bin=separate_bin,
+        scratch_dir=scratch,
+        cancel=None,
+        transcript_backend=transcript_backend,
+    )
+
+
+def _interjection_backend(_stem: Path) -> list[dict[str, object]]:
+    """Mock transcript backend returning interjection-dominated text."""
+    return [
+        {
+            "start": 0.0,
+            "end": 1.0,
+            "text": "wow",
+            "no_speech_prob": 0.1,
+            "avg_logprob": -0.2,
+        },
+        {
+            "start": 1.0,
+            "end": 2.0,
+            "text": "oh wow",
+            "no_speech_prob": 0.1,
+            "avg_logprob": -0.2,
+        },
+    ]
+
+
+def _lyrics_backend(_stem: Path) -> list[dict[str, object]]:
+    """Mock transcript backend returning confident real-word lyrics."""
+    return [
+        {
+            "start": 0.0,
+            "end": 2.0,
+            "text": "hello world this is my song",
+            "language": "en",
+            "no_speech_prob": 0.1,
+            "avg_logprob": -0.2,
+        }
+    ]
+
+
+def _silent_backend(_stem: Path) -> list[dict[str, object]]:
+    """Mock transcript backend returning nothing confident (all dropped)."""
+    return [
+        {
+            "start": 0.0,
+            "end": 1.0,
+            "text": "music",
+            "no_speech_prob": 0.9,
+            "avg_logprob": -2.0,
+        }
+    ]
+
+
+def test_vocal_ladder_roformer_rung_via_fake(tmp_path, monkeypatch):
+    """Rung 1 (roformer via fake) -> vocal_type vocalization from interjections."""
+    mix_path = _write_tone_wav(tmp_path / "mix.wav", 300.0, 4.0, amp=0.05)
+    result = _run_vocal_analysis(
+        tmp_path, mix_path, monkeypatch, transcript_backend=_interjection_backend
+    )
+    assert result["degraded_rung"] == "roformer", result
+    assert result["vocal_presence"] > 0.15, result
+    assert result["vocal_timeline"], result
+    assert result["vocal_type"] == "vocalization", result
+
+
+def test_vocal_ladder_pyin_fallback(tmp_path, monkeypatch):
+    """Missing separate_bin degrades to rung 2 (pyin) without crashing."""
+    mix_path = _write_tone_wav(tmp_path / "mix.wav", 220.0, 4.0, amp=0.5)
+    result = _run_vocal_analysis(
+        tmp_path, mix_path, monkeypatch, separate_bin=Path("/nonexistent")
+    )
+    assert result["degraded_rung"] == "pyin", result
+    assert result["vocal_presence"] >= 0.0, result
+    assert "vocal_type" in result, result
+
+
+def test_vocal_type_lyrics_vs_instrumental(tmp_path, monkeypatch):
+    """Real-word lyrics -> lyrics+language; nothing confident -> instrumental+possible."""
+    mix_path = _write_tone_wav(tmp_path / "mix.wav", 300.0, 4.0, amp=0.05)
+
+    lyrics = _run_vocal_analysis(
+        tmp_path, mix_path, monkeypatch, transcript_backend=_lyrics_backend
+    )
+    assert lyrics["vocal_type"] == "lyrics", lyrics
+    assert lyrics["language"] == "en", lyrics
+    assert lyrics["transcript_sample"] is not None, lyrics
+
+    instrumental = _run_vocal_analysis(
+        tmp_path, mix_path, monkeypatch, transcript_backend=_silent_backend
+    )
+    assert instrumental["vocal_type"] == "instrumental", instrumental
+    assert instrumental["vocal_instrumental_possible"] is True, instrumental
+
+
+UVR_ROOT = (
+    Path.home() / ".clone" / "Github" / "SuperBypassUdinnn" / "ultimatevocalremovergui"
+)
+UVR_VENV = UVR_ROOT / ".venv" / "bin" / "python"
+VOCALS_CKPT = UVR_ROOT / "checkpoints" / "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+
+
+@pytest.mark.skipif(
+    not UVR_VENV.exists() or not VOCALS_CKPT.exists(),
+    reason="UVR venv or vocals checkpoint absent (CI-safe skip)",
+)
+def test_roformer_runner_smoke_skipped_when_no_venv(tmp_path):
+    """Real-runner smoke test; skipped when UVR venv/checkpoint absent."""
+    import subprocess
+
+    mix_path = _write_tone_wav(tmp_path / "mix.wav", 300.0, 3.0, amp=0.5)
+    out_dir = tmp_path / "stems"
+    done = subprocess.run(
+        [
+            str(UVR_VENV),
+            str(REPO_ROOT / "separators" / "roformer_runner.py"),
+            str(mix_path),
+            str(out_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert done.returncode == 0, done.stderr
+    assert (out_dir / "vocals.wav").is_file()
+    assert (out_dir / "instrumental.wav").is_file()
