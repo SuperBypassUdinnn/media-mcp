@@ -211,16 +211,22 @@ def test_detect_music_librosa_engine(tmp_path):
 
 
 def test_detect_music_numpy_fallback(tmp_path):
-    path = _write_click_track(tmp_path / "clicks.wav")
+    path = _write_tonal_bed(tmp_path / "pad.wav")
     result = media_mod.detect_music(path, wrapper=Path("/nonexistent"))
     assert result.engine == "numpy"
     assert result.degraded is True
     # Later stages fill mix/vocals; the baseline leaves them unset.
     assert result.mix is None and result.vocals is None
-    assert 0.0 <= result.harmonic_ratio <= 1.0
+    # A sustained sine pad is harmonic-dominated: pins the HPSS axis
+    # orientation (harmonic = median along the time axis).
+    assert result.harmonic_ratio > 0.5, result
+    # The C-major triad fold must land on pitch class 0 = C: pins the
+    # pitch-class mapping (A440 -> pitch class 9).
+    assert result.key == "C major", result
+    assert result.mode == "major", result
+    assert result.key_confidence is not None and 0.0 <= result.key_confidence <= 1.0
     assert isinstance(result.mood_tags, tuple)
     assert isinstance(result.arrangement, tuple)
-    # key may be None for a click track, but the contract fields are present.
     for name in (
         "duration",
         "transient_density",

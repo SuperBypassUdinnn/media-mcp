@@ -1903,15 +1903,15 @@ def _pitch_class_chroma(
     """Fold STFT magnitude into 12 magnitude-weighted pitch classes per frame.
 
     Bin center frequencies map to pitch classes via
-    `pc = (12 * log2(f / 440 Hz)) mod 12` (A4 = 440 Hz is pitch class 9,
-    so C lands at 0 after the modulo shift), and each bin's magnitude is
-    added to its class. Returns a (12, n_frames) matrix.
+    `pc = round(12 * log2(f / 440 Hz) + 9) mod 12` (A4 = 440 Hz lands on
+    pitch class 9, index 0 is C), and each bin's magnitude is added to its
+    class. Returns a (12, n_frames) matrix.
     """
     import numpy as np
 
     freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
     with np.errstate(divide="ignore", invalid="ignore"):
-        pitch_classes = (12.0 * np.log2(freqs / 440.0)) % 12.0
+        pitch_classes = np.rint(12.0 * np.log2(freqs / 440.0) + 9.0) % 12.0
     pitch_classes = np.nan_to_num(
         pitch_classes, nan=0.0, posinf=0.0, neginf=0.0
     ).astype(int)
@@ -2037,8 +2037,8 @@ def detect_music(
         else 0.0
     )
 
-    harmonic = _median_filter(spectrum, _HPSS_TIME_KERNEL, axis=1)
-    percussive = _median_filter(spectrum, _HPSS_FREQ_KERNEL, axis=0)
+    harmonic = _median_filter(spectrum, _HPSS_TIME_KERNEL, axis=0)
+    percussive = _median_filter(spectrum, _HPSS_FREQ_KERNEL, axis=1)
     harmonic_energy = float(np.square(harmonic).sum())
     percussive_energy = float(np.square(percussive).sum())
     harmonic_ratio = (
