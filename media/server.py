@@ -2972,7 +2972,6 @@ def _music_work(
         "loopiness": result.loopiness,
         "source": resolved.source,
     }
-    _write_json(entry / "music.json", payload)
     mix = None
     if sfx_manifest is not None:
         manifest = json.loads(manifest_text)
@@ -2987,7 +2986,7 @@ def _music_work(
         payload["duck_pump_rate"] = mix["duck_pump_rate"]
         payload["key_clash_score"] = mix["key_clash_score"]
         payload["skipped_cues"] = mix["skipped_cues"]
-        _write_json(entry / "music.json", payload)
+    _write_json(entry / "music.json", payload)
     _record_entry(entry, resolved)
     if result.key is None:
         lines = [

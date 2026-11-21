@@ -2203,8 +2203,16 @@ def _key_triad(key: str | None, mode: str | None) -> tuple[int, ...] | None:
     return (root, (root + third) % 12, (root + 7) % 12)
 
 
-def _cue_clash(cue_path: Path, scratch_dir: Path | None, cancel) -> float | None:
-    """Dissonance of one cue against the key triad, or None when it cannot be decoded."""
+def _cue_clash(
+    cue_path: Path, scratch_dir: Path | None, cancel
+) -> tuple[np.ndarray, float, int] | None:
+    """Dissonance of one cue against the key triad, or None when it cannot be decoded.
+
+    Returns ``(profile, total, sample_count)``: the cue's chroma profile, its
+    mass (``profile.sum()``), and the decoded sample count — the caller
+    computes ``duration = sample_count / _BEAT_SAMPLE_RATE`` from that, so a
+    cue is decoded exactly once.
+    """
     try:
         pcm = _decode_mono_pcm(cue_path, scratch_dir=scratch_dir, cancel=cancel)
     except MediaError:
@@ -2218,7 +2226,7 @@ def _cue_clash(cue_path: Path, scratch_dir: Path | None, cancel) -> float | None
     total = float(profile.sum())
     if total <= 1e-12:
         return None
-    return profile, total
+    return profile, total, int(pcm.size)
 
 
 def _profile_clash(profile: np.ndarray, triad: tuple[int, ...]) -> float:
@@ -2267,10 +2275,8 @@ def mix_score_music(
             duration = _CUE_DURATION_S
             profile = None
         else:
-            profile, _total = clash
-            duration = round(
-                float(clue_pcm_size(Path(cue["path"])) / _BEAT_SAMPLE_RATE), 6
-            )
+            profile, _total, sample_count = clash
+            duration = round(sample_count / _BEAT_SAMPLE_RATE, 6)
         starts.append(start)
         ends.append(start + duration)
         cue_data.append({"cue": cue, "profile": profile})
@@ -2310,20 +2316,12 @@ def mix_score_music(
     }
 
 
-def clue_pcm_size(path: Path) -> int:
-    """Sample count of a decoded mono PCM file, or the assumed cue length."""
-    try:
-        return int(_decode_mono_pcm(Path(path)).size)
-    except MediaError:
-        return int(_CUE_DURATION_S * _BEAT_SAMPLE_RATE)
-
-
 def _duck_pump_rate(pcm: np.ndarray) -> float:
     """pumps/s: depth of mid-band (200-2000 Hz) amplitude modulation.
 
     Band-pass the decode via an STFT slice, build a 0.1 s RMS envelope, then
-    count local minima below 60% of adjacent local maxima spaced at least
-    0.5 Hz apart (>= 2 s between pumps).
+    count local minima below 60% of adjacent local maxima; rate = pumps /
+    envelope duration.
     """
     import numpy as np
     from scipy.signal import istft, stft
